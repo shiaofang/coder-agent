@@ -9,7 +9,6 @@ venv/
 .env.*
 
 # Local llama runtime (large binaries)
-bin/
 models/
 *.gguf
 *.dll
