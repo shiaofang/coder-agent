@@ -1,7 +1,5 @@
 @echo off
-chcp 65001 >nul
 setlocal EnableDelayedExpansion
-
 cd /d "%~dp0"
 
 set "BIN_DIR=%~dp0bin"
@@ -10,33 +8,32 @@ set "HOST=127.0.0.1"
 set "PORT=8080"
 set "NGL=99"
 set "CTX=40000"
-set "SERVER_PID="
 
 if not exist "%BIN_DIR%\llama-server.exe" (
-    echo [错误] 找不到 llama-server.exe: %BIN_DIR%\llama-server.exe
+    echo [ERROR] llama-server.exe not found
     pause
     exit /b 1
 )
 
 where python >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 找不到 python，请先安装 Python 并加入 PATH
+    echo [ERROR] python not found in PATH
     pause
     exit /b 1
 )
 
 if not exist "%MODEL_DIR%" (
-    echo [错误] 找不到 models 目录: %MODEL_DIR%
+    echo [ERROR] models folder not found
     pause
     exit /b 1
 )
 
 echo.
 echo ========================================
-echo   本地模型终端对话
+echo   Local Model Chat
 echo ========================================
 echo.
-echo 可用模型:
+echo Available models:
 echo.
 
 set "COUNT=0"
@@ -48,49 +45,59 @@ for %%F in ("%MODEL_DIR%\*.gguf") do (
 )
 
 if %COUNT%==0 (
-    echo [错误] models 目录下没有 .gguf 模型文件
+    echo [ERROR] no .gguf files in models\
     pause
     exit /b 1
 )
 
+:choose_model
 echo.
-set /p CHOICE=请输入序号选择模型 [1-%COUNT%]: 
+set "CHOICE="
+set /p CHOICE=Select model [1-%COUNT%]: 
 
-echo %CHOICE%| findstr /r "^[1-9][0-9]*$" >nul
+if not defined CHOICE (
+    echo [ERROR] enter a number
+    goto choose_model
+)
+
+echo !CHOICE!| findstr /r "^[1-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo [错误] 无效输入
-    pause
-    exit /b 1
+    echo [ERROR] invalid, enter 1-%COUNT%
+    goto choose_model
 )
 
-if %CHOICE% LSS 1 (
-    echo [错误] 序号超出范围
-    pause
-    exit /b 1
+if !CHOICE! LSS 1 (
+    echo [ERROR] out of range, enter 1-%COUNT%
+    goto choose_model
 )
-if %CHOICE% GTR %COUNT% (
-    echo [错误] 序号超出范围
-    pause
-    exit /b 1
+if !CHOICE! GTR %COUNT% (
+    echo [ERROR] out of range, enter 1-%COUNT%
+    goto choose_model
 )
 
 set "SELECTED=!MODEL_%CHOICE%!"
 set "SELECTED_NAME=!NAME_%CHOICE%!"
 
+if not defined SELECTED (
+    echo [ERROR] invalid index
+    goto choose_model
+)
+if not exist "!SELECTED!" (
+    echo [ERROR] model file missing
+    goto choose_model
+)
+
 echo.
-echo 已选择: %SELECTED_NAME%
-echo 地址:   http://%HOST%:%PORT%
-echo GPU层:  %NGL%  ^|  上下文: %CTX%
-echo 能力:   本地文件读写 / 命令执行（chat.py 工具）
+echo Selected: !SELECTED_NAME!
+echo URL: http://%HOST%:%PORT%
 echo.
-echo 正在后台启动 llama-server ...
+echo Starting llama-server ...
 echo.
 
-REM 清理可能残留的旧服务
 taskkill /F /IM llama-server.exe >nul 2>&1
 
 start "llama-server" /MIN "%BIN_DIR%\llama-server.exe" ^
-  -m "%SELECTED%" ^
+  -m "!SELECTED!" ^
   --host %HOST% ^
   --port %PORT% ^
   -ngl %NGL% ^
@@ -98,12 +105,12 @@ start "llama-server" /MIN "%BIN_DIR%\llama-server.exe" ^
   --jinja
 
 python "%~dp0chat.py"
-set "CHAT_EXIT=%ERRORLEVEL%"
+set "CHAT_EXIT=!ERRORLEVEL!"
 
 echo.
-echo 正在关闭后台服务...
+echo Stopping background service...
 taskkill /F /IM llama-server.exe >nul 2>&1
 
-echo 已结束。
-if not "%CHAT_EXIT%"=="0" pause
-exit /b %CHAT_EXIT%
+echo Done.
+if not "!CHAT_EXIT!"=="0" pause
+exit /b !CHAT_EXIT!

@@ -73,6 +73,14 @@ CLEAR_CMDS = {"/clear", "/reset", "/new"}
 AUTO_CMDS = {"/auto"}
 MANUAL_CMDS = {"/manual"}
 
+# 输入以 / 开头时弹出的命令菜单（展示用；实际匹配仍看上面的集合）
+SLASH_MENU: list[tuple[str, str]] = [
+    ("/clear", "清空对话"),
+    ("/auto", "全程自动执行"),
+    ("/manual", "每次确认"),
+    ("/exit", "退出"),
+]
+
 # 安全与性能上限：
 #   MAX_TOOL_ROUNDS     — 一轮用户任务里，最多允许「模型调工具」多少次，防止死循环
 #   MAX_READ_CHARS      — 读文件返回给模型的最大字符数，避免上下文爆掉
@@ -424,6 +432,7 @@ class C:
     TOOL_ERR = "\033[38;5;203m"
     STATUS = "\033[38;5;246m"
     TEAL = "\033[38;5;44m"
+    PATH = "\033[38;5;75m"
     ERR = "\033[91m"
 
 def enable_ansi() -> None:
@@ -478,18 +487,180 @@ def flush_input_buffer() -> None:
     except Exception:
         pass
 
+# 状态栏当前内容：右下角模型名、左下角当前目录
+_STATUS_MODEL = ""
+_STATUS_CWD = ""
+
 def print_banner(model_id: str) -> None:
-    """打印启动横幅：模型名、快捷命令说明。"""
+    """
+    启动时打印一段简单的自我介绍横幅（参考 Claude Code / Codex CLI 等终端产品的欢迎框），
+    避免刚进终端时一片空白。模型名 / 当前目录不在框里重复展示，
+    而是常驻在终端状态栏：右下角模型名，左下角目录（蓝色高亮）。
+    """
+    cwd = str(Path.cwd())
+    width = min(term_cols(), 72)
+    inner = width - 4  # 边框 "│ " 与 " │" 共占 4 格
+
+    def line(painted: str = "") -> str:
+        pad = max(0, inner - _visible_cols(painted))
+        return paint("│ ", C.SEP) + painted + " " * pad + paint(" │", C.SEP)
+
+    # 每行文字都先按当前宽度裁剪，避免窄终端下把方框撑破
+    title = _truncate_display("✻ Coder Agent", inner)
+    subtitle = _truncate_display("本地终端编程助手，直接读文件、改代码、跑命令、查资料", inner)
+    tip1 = _truncate_display('说说想做什么，例如："帮我在这个目录创建一个 vue3 项目"', inner)
+    tip2_full = "/ 查看命令  ·  /auto 自动执行  ·  /exit 退出"
+    tip2 = _truncate_display(tip2_full, inner)
+
+    # 必须先设置状态栏：它会用 DECSTBM（设置滚动区域）把光标重置回左上角，
+    # 这是终端的副作用。如果放在横幅之后调用，光标会被拽回第一行，
+    # 之后 read_input() 里的 "\033[J" 清屏就会把刚打印的横幅整个抹掉。
+    setup_status_bar(model_id, cwd)
+
     print()
-    print(paint(f"  {model_id}", C.STATUS))
-    print(paint("  tools: edit/lines/files/grep/shell/web", C.TEAL))
-    print(paint("  写文件/命令：↑↓ 选择  Enter 确认", C.STATUS))
-    print(paint("  /clear 清空  /auto 全程自动  /manual 每次确认  /exit 退出", C.DIM, C.STATUS))
-    print(paint("  Ctrl+C 取消当前任务；提示符下再按一次退出", C.DIM, C.STATUS))
+    print(paint("╭" + "─" * (width - 2) + "╮", C.SEP))
+    print(line(paint(title, C.BOLD, C.REPLY_ICON)))
+    print(line(paint(subtitle, C.DIM, C.STATUS)))
+    print(line())
+    print(line(paint(tip1, C.DIM, C.STATUS)))
+    if tip2 == tip2_full:
+        # 宽度够时才分色高亮命令，否则退化为单色裁剪文本
+        print(
+            line(
+                paint("/", C.TEAL)
+                + paint(" 查看命令  ·  ", C.DIM, C.STATUS)
+                + paint("/auto", C.TEAL)
+                + paint(" 自动执行  ·  ", C.DIM, C.STATUS)
+                + paint("/exit", C.TEAL)
+                + paint(" 退出", C.DIM, C.STATUS)
+            )
+        )
+    else:
+        print(line(paint(tip2, C.DIM, C.STATUS)))
+    print(paint("╰" + "─" * (width - 2) + "╯", C.SEP))
     print()
 
-def _read_key() -> str:
-    """Return: up / down / enter / esc / 1 / 2 / other"""
+def setup_status_bar(model_id: str, cwd: str | None = None) -> None:
+    """预留下方一行，把模型名（右下角）和当前目录（左下角）固定画在终端状态栏。"""
+    global _STATUS_MODEL, _STATUS_CWD
+    _STATUS_MODEL = model_id
+    _STATUS_CWD = cwd if cwd is not None else str(Path.cwd())
+    if not sys.stdout.isatty():
+        return
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        return
+    if rows >= 3:
+        # 滚动区不含最后一行，状态栏不被聊天内容顶掉
+        sys.stdout.write(f"\033[1;{rows - 1}r")
+    draw_status_bar()
+    sys.stdout.flush()
+
+def draw_status_bar() -> None:
+    """
+    画最后一行状态栏（保存/恢复光标，不打扰当前输入）：
+    左下角蓝色高亮显示当前目录，右下角绿色显示模型名。
+    """
+    if (not _STATUS_MODEL and not _STATUS_CWD) or not sys.stdout.isatty():
+        return
+    try:
+        size = os.get_terminal_size()
+        rows, cols = size.lines, size.columns
+    except OSError:
+        return
+
+    right_label = ""
+    right_width = 0
+    if _STATUS_MODEL:
+        right_label = _truncate_display(_STATUS_MODEL, max(8, cols - 1))
+        right_width = _status_text_width(right_label)
+
+    left_label = ""
+    if _STATUS_CWD:
+        gap = 2 if right_width else 0
+        max_left_w = max(0, cols - right_width - gap - 1)
+        left_label = _truncate_display(_STATUS_CWD, max_left_w)
+
+    out = ["\033[s", f"\033[{rows};1H\033[2K"]
+    if left_label:
+        out.append(f"\033[{rows};1H{paint(left_label, C.BOLD, C.PATH)}")
+    if right_label:
+        col = max(1, cols - right_width + 1)
+        out.append(f"\033[{rows};{col}H{paint(right_label, C.BOLD, C.TOOL_OK)}")
+    out.append("\033[u")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+def _status_text_width(text: str) -> int:
+    """状态栏文本显示宽度（中文等宽字符按 2 算）。"""
+    w = 0
+    for ch in text:
+        o = ord(ch)
+        if o <= 0x7F:
+            w += 1
+        elif 0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F:
+            w += 2
+        else:
+            w += 1
+    return w
+
+def _truncate_display(text: str, max_w: int) -> str:
+    """按显示宽度裁剪文本，超出部分用省略号代替（状态栏、横幅共用）。"""
+    if max_w <= 0:
+        return ""
+    if _status_text_width(text) <= max_w:
+        return text
+    out = text
+    while out and _status_text_width(out + "…") > max_w:
+        out = out[:-1]
+    return (out + "…") if out else "…"
+
+def switch_cwd(new_dir: Path) -> None:
+    """切换进程的当前工作目录，并同步刷新左下角状态栏显示。"""
+    global _STATUS_CWD
+    os.chdir(new_dir)
+    _STATUS_CWD = str(Path.cwd())
+    draw_status_bar()
+
+def _looks_like_path_input(path_candidate: str) -> bool:
+    """粗判「用户是不是在输入一个路径」，避免把普通聊天内容误当路径。"""
+    if not path_candidate:
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", path_candidate):
+        return True
+    if path_candidate.startswith("\\\\") or path_candidate.startswith("//"):
+        return True
+    if path_candidate.startswith("~"):
+        return True
+    if (
+        path_candidate.startswith("./")
+        or path_candidate.startswith(".\\")
+        or path_candidate.startswith("../")
+        or path_candidate.startswith("..\\")
+    ):
+        return True
+    return ("\\" in path_candidate or "/" in path_candidate) and not any(
+        c in path_candidate for c in "，。！？：；、\n"
+    )
+
+def teardown_status_bar() -> None:
+    """退出时恢复全屏滚动并清掉状态栏。"""
+    if not sys.stdout.isatty():
+        return
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        rows = 24
+    sys.stdout.write(f"\033[r\033[{rows};1H\033[2K")
+    sys.stdout.flush()
+
+def _read_input_key() -> tuple[str, str]:
+    """
+    读一个按键。返回 (kind, value)：
+      up/down/enter/esc/backspace/tab  → value 为空
+      char → value 为字符
+    """
     if os.name == "nt":
         import msvcrt
 
@@ -497,23 +668,28 @@ def _read_key() -> str:
         if ch in ("\x00", "\xe0"):
             ch2 = msvcrt.getwch()
             if ch2 == "H":
-                return "up"
+                return ("up", "")
             if ch2 == "P":
-                return "down"
-            return "other"
+                return ("down", "")
+            if ch2 == "K":  # left — ignore
+                return ("other", "")
+            if ch2 == "M":  # right — ignore
+                return ("other", "")
+            return ("other", "")
         if ch in ("\r", "\n"):
-            return "enter"
+            return ("enter", "")
         if ch == "\x1b":
-            return "esc"
+            return ("esc", "")
         if ch == "\x03":
             raise KeyboardInterrupt
-        if ch in ("1", "2"):
-            return ch
-        if ch.lower() == "q":
-            return "esc"
-        return "other"
+        if ch in ("\x08", "\x7f"):
+            return ("backspace", "")
+        if ch == "\t":
+            return ("tab", "")
+        if ch >= " " and ch != "\x7f":
+            return ("char", ch)
+        return ("other", "")
 
-    # POSIX fallback
     import termios
     import tty
 
@@ -525,19 +701,34 @@ def _read_key() -> str:
         if ch == "\x1b":
             rest = sys.stdin.read(2)
             if rest == "[A":
-                return "up"
+                return ("up", "")
             if rest == "[B":
-                return "down"
-            return "esc"
+                return ("down", "")
+            return ("esc", "")
         if ch in ("\r", "\n"):
-            return "enter"
+            return ("enter", "")
         if ch == "\x03":
             raise KeyboardInterrupt
-        if ch in ("1", "2"):
-            return ch
-        return "other"
+        if ch in ("\x7f", "\x08"):
+            return ("backspace", "")
+        if ch == "\t":
+            return ("tab", "")
+        if ch >= " ":
+            return ("char", ch)
+        return ("other", "")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def _read_key() -> str:
+    """工具确认菜单用：up / down / enter / esc / 1 / 2 / other"""
+    kind, val = _read_input_key()
+    if kind == "char" and val in ("1", "2"):
+        return val
+    if kind == "char" and val.lower() == "q":
+        return "esc"
+    if kind in {"up", "down", "enter", "esc"}:
+        return kind
+    return "other"
 
 def ask_tool_approval(name: str, args: dict) -> bool:
     """↑↓ 选择，Enter 确认。返回 True 表示允许执行。"""
@@ -721,12 +912,12 @@ def resolve_path(path: str) -> Path:
 
     return cwd_cand
 
-def extract_abs_paths(text: str) -> list[str]:
-    """Find Windows absolute paths mentioned in user text."""
+def extract_abs_paths(user_input: str) -> list[str]:
+    """从用户输入里找出 Windows 绝对路径。"""
     # Stop before whitespace / Chinese punctuation so "C:\\a\\b，看下" works
     found = re.findall(
         r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n\s，。；、！？]+\\)*[^\\/:*?\"<>|\r\n\s，。；、！？]+",
-        text,
+        user_input,
     )
     # Deduplicate, keep order
     seen: set[str] = set()
@@ -1744,17 +1935,157 @@ def run_agent_turn(messages: list[dict]) -> None:
 # 直接运行本文件时从这里开始。被 import 时不会自动执行 main。
 #
 
+def _slash_matches(prefix: str) -> list[tuple[str, str]]:
+    """按已输入前缀过滤斜杠命令（前缀不含大小写敏感）。"""
+    p = prefix.lower()
+    return [(cmd, hint) for cmd, hint in SLASH_MENU if cmd.lower().startswith(p)]
+
+
+def _visible_cols(text: str) -> int:
+    """粗算终端显示宽度（用于把光标移回输入末尾）。"""
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    w = 0
+    for ch in plain:
+        o = ord(ch)
+        if o <= 0x7F:
+            w += 1
+        elif 0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F:
+            w += 2
+        else:
+            w += 1
+    return w
+
 def read_input(model_id: str) -> str:
-    """打印提示符，读取用户输入的一行文字。"""
+    """
+    打印提示符并读一行用户输入（返回 strip 后的字符串）。
+    输入 / 时在下方「悬浮」命令列表，光标始终停在输入行；↑↓ 选择，Tab/Enter 确认，Esc 关闭。
+    """
     sep()
-    print(paint(f"  {model_id}", C.STATUS) + paint("  ·  enter to send", C.DIM, C.STATUS))
-    sys.stdout.write(paint("❯", C.PROMPT) + " ")
-    sys.stdout.flush()
+    draw_status_bar()
+
+    if not sys.stdin.isatty():
+        sys.stdout.write(paint("❯", C.PROMPT) + " ")
+        sys.stdout.flush()
+        try:
+            return input().strip()
+        except (EOFError, KeyboardInterrupt):
+            raise
+
+    buf = ""
+    menu_idx = 0
+    menu_suppressed = False
+    menu_count = 0  # 当前悬浮菜单行数
+
+    def matches() -> list[tuple[str, str]]:
+        if not buf.startswith("/"):
+            return []
+        return _slash_matches(buf)
+
+    def clear_float() -> None:
+        """清掉输入行及下方悬浮菜单，光标回到行首。"""
+        nonlocal menu_count
+        sys.stdout.write("\r\033[J")
+        sys.stdout.flush()
+        menu_count = 0
+
+    def render() -> None:
+        """重绘输入行，菜单画在下方后把光标移回输入末尾。"""
+        nonlocal menu_idx, menu_count
+        clear_float()
+
+        items = matches()
+        show_menu = bool(items) and not menu_suppressed
+        if show_menu:
+            menu_idx %= len(items)
+
+        prompt = paint("❯", C.PROMPT) + " " + paint(buf, C.USER_FG)
+        sys.stdout.write(prompt)
+
+        if show_menu:
+            for i, (cmd, hint) in enumerate(items):
+                if i == menu_idx:
+                    line = (
+                        paint("  ❯ ", C.TEAL)
+                        + paint(cmd, C.BOLD, C.TEAL)
+                        + paint(f"  {hint}", C.DIM, C.STATUS)
+                    )
+                else:
+                    line = (
+                        paint("    ", C.DIM)
+                        + paint(cmd, C.STATUS)
+                        + paint(f"  {hint}", C.DIM, C.STATUS)
+                    )
+                sys.stdout.write("\n\033[2K" + line)
+            menu_count = len(items)
+            # 回到输入行，光标落在 buf 末尾（❯ + 空格 + buf）
+            col = 1 + _visible_cols("❯ ") + _visible_cols(buf)
+            sys.stdout.write(f"\033[{menu_count}A\033[{col}G")
+        else:
+            menu_count = 0
+
+        draw_status_bar()
+        sys.stdout.flush()
+
+    def finish(text: str) -> str:
+        """提交：清掉悬浮层，留下一行最终输入。"""
+        clear_float()
+        sys.stdout.write(paint("❯", C.PROMPT) + " " + paint(text, C.USER_FG) + "\n")
+        draw_status_bar()
+        sys.stdout.flush()
+        return text
+
+    render()
     try:
-        line = input()
-    except (EOFError, KeyboardInterrupt):
+        while True:
+            kind, val = _read_input_key()
+            items = matches()
+            show_menu = bool(items) and not menu_suppressed
+
+            if kind == "up" and show_menu:
+                menu_idx = (menu_idx - 1) % len(items)
+                render()
+                continue
+            if kind == "down" and show_menu:
+                menu_idx = (menu_idx + 1) % len(items)
+                render()
+                continue
+            if kind == "tab" and show_menu:
+                buf = items[menu_idx][0]
+                menu_idx = 0
+                menu_suppressed = False
+                render()
+                continue
+            if kind == "esc":
+                if show_menu:
+                    menu_suppressed = True
+                    render()
+                    continue
+                return finish(buf.strip())
+            if kind == "enter":
+                if show_menu:
+                    return finish(items[menu_idx][0])
+                return finish(buf.strip())
+            if kind == "backspace":
+                if buf:
+                    buf = buf[:-1]
+                    menu_idx = 0
+                    menu_suppressed = False
+                render()
+                continue
+            if kind == "char":
+                if not buf and val.isspace():
+                    continue
+                buf += val
+                menu_idx = 0
+                menu_suppressed = False
+                render()
+                continue
+    except KeyboardInterrupt:
+        clear_float()
+        sys.stdout.write("\n")
+        draw_status_bar()
+        sys.stdout.flush()
         raise
-    return line.strip()
 
 def main() -> int:
     """
@@ -1782,64 +2113,89 @@ def main() -> int:
         model_id = "loaded"
     model_id = os.path.basename(model_id)
 
-    # 3) 查出模型名，打印欢迎信息
+    # 3) 右下角显示模型名
     print_banner(model_id)
     # 4) 对话历史：第一条永远是 system 提示词
     messages: list[dict] = [{"role": "system", "content": build_system_prompt()}]
 
     # 5) 主循环：读用户输入 → 处理斜杠命令 → 交给 Agent
+    try:
+        while True:
+            try:
+                user_input = read_input(model_id)
+            except (EOFError, KeyboardInterrupt):
+                print(paint("\n\n  bye.", C.DIM, C.STATUS))
+                break
 
-    while True:
-        try:
-            user = read_input(model_id)
-        except (EOFError, KeyboardInterrupt):
-            print(paint("\n\n  bye.", C.DIM, C.STATUS))
-            break
+            if not user_input:
+                continue
 
-        if not user:
-            continue
-        if user.lower() in EXIT_CMDS:
-            print(paint("\n  bye.", C.DIM, C.STATUS))
-            break
-        if user.lower() in CLEAR_CMDS:
-            messages = [{"role": "system", "content": build_system_prompt()}]
-            AUTO_APPROVE = False
-            print(paint("\n  ✓ conversation cleared\n", C.TEAL))
-            continue
-        if user.lower() in AUTO_CMDS:
-            AUTO_APPROVE_ALWAYS = True
-            print(paint("\n  ✓ 已开启全程自动执行（/manual 关闭）\n", C.TEAL))
-            continue
-        if user.lower() in MANUAL_CMDS:
-            AUTO_APPROVE = False
-            AUTO_APPROVE_ALWAYS = False
-            print(paint("\n  ✓ 已恢复每次确认\n", C.TEAL))
-            continue
+            # 直接输入一个路径（拖拽文件夹/文件进终端也算）并回车：切换当前工作目录，
+            # 左下角状态栏跟着变，不当作聊天消息发给模型。
+            path_candidate = user_input.strip().strip('"').strip("'")
+            if _looks_like_path_input(path_candidate):
+                resolved_path = resolve_path(path_candidate)
+                target_dir = (
+                    resolved_path
+                    if resolved_path.is_dir()
+                    else (resolved_path.parent if resolved_path.is_file() else None)
+                )
+                if target_dir is not None:
+                    switch_cwd(target_dir)
+                    messages[0]["content"] = build_system_prompt()
+                    print(paint(f"\n  ✓ 已切换工作目录：{target_dir}\n", C.TEAL))
+                    continue
 
-        print()
-        # Remind model to keep absolute paths verbatim
-        abs_paths = extract_abs_paths(user)
-        user_payload = user
-        if abs_paths:
-            joined = " | ".join(abs_paths)
-            user_payload = (
-                user
-                + f"\n\n[系统路径提示] 请原样使用这些绝对路径调用工具，不要改成相对路径：{joined}"
-            )
-        messages.append({"role": "user", "content": user_payload})
+            cmd = user_input.lower()
+            if cmd in EXIT_CMDS:
+                print(paint("\n  bye.", C.DIM, C.STATUS))
+                break
+            if cmd in CLEAR_CMDS:
+                messages = [{"role": "system", "content": build_system_prompt()}]
+                AUTO_APPROVE = False
+                print(paint("\n  ✓ conversation cleared\n", C.TEAL))
+                draw_status_bar()
+                continue
+            if cmd in AUTO_CMDS:
+                AUTO_APPROVE_ALWAYS = True
+                print(paint("\n  ✓ 已开启全程自动执行（/manual 关闭）\n", C.TEAL))
+                draw_status_bar()
+                continue
+            if cmd in MANUAL_CMDS:
+                AUTO_APPROVE = False
+                AUTO_APPROVE_ALWAYS = False
+                print(paint("\n  ✓ 已恢复每次确认\n", C.TEAL))
+                draw_status_bar()
+                continue
 
-        try:
-            # 真正干活：多轮工具调用直到模型给出最终回答
-            run_agent_turn(messages)
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            print(paint(f"✗  HTTP {e.code}: {detail}", C.ERR))
-            messages.pop()
-            continue
-        except Exception as e:
-            print(paint(f"✗  {e}", C.ERR))
-            messages.pop()
-            continue
+            print()
+            # 提醒模型：用户原文里的绝对路径要原样使用
+            abs_paths = extract_abs_paths(user_input)
+            user_message_content = user_input
+            if abs_paths:
+                abs_paths_joined = " | ".join(abs_paths)
+                user_message_content = (
+                    user_input
+                    + f"\n\n[系统路径提示] 请原样使用这些绝对路径调用工具，不要改成相对路径：{abs_paths_joined}"
+                )
+            messages.append({"role": "user", "content": user_message_content})
+
+            try:
+                # 真正干活：多轮工具调用直到模型给出最终回答
+                run_agent_turn(messages)
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                print(paint(f"✗  HTTP {e.code}: {detail}", C.ERR))
+                messages.pop()
+                continue
+            except Exception as e:
+                print(paint(f"✗  {e}", C.ERR))
+                messages.pop()
+                continue
+            finally:
+                draw_status_bar()
+    finally:
+        teardown_status_bar()
 
     return 0
 
