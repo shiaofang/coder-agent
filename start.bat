@@ -4,16 +4,11 @@ cd /d "%~dp0"
 
 set "BIN_DIR=%~dp0bin"
 set "MODEL_DIR=%~dp0models"
+set "CLOUD_CFG=%~dp0cloud_config.json"
 set "HOST=127.0.0.1"
 set "PORT=8080"
 set "NGL=99"
 set "CTX=40000"
-
-if not exist "%BIN_DIR%\llama-server.exe" (
-    echo [ERROR] llama-server.exe not found
-    pause
-    exit /b 1
-)
 
 where python >nul 2>&1
 if errorlevel 1 (
@@ -22,38 +17,49 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "%MODEL_DIR%" (
-    echo [ERROR] models folder not found
-    pause
-    exit /b 1
-)
-
 echo.
 echo ========================================
-echo   Local Model Chat
+echo   Coder Agent
 echo ========================================
 echo.
 echo Available models:
 echo.
 
 set "COUNT=0"
-for %%F in ("%MODEL_DIR%\*.gguf") do (
-    set /a COUNT+=1
-    set "MODEL_!COUNT!=%%~fF"
-    set "NAME_!COUNT!=%%~nxF"
-    echo   !COUNT!. %%~nxF
+if exist "%MODEL_DIR%" (
+    for %%F in ("%MODEL_DIR%\*.gguf") do (
+        set /a COUNT+=1
+        set "MODEL_!COUNT!=%%~fF"
+        set "NAME_!COUNT!=%%~nxF"
+        echo   !COUNT!. %%~nxF  [local]
+    )
+)
+
+set /a CLOUD_INDEX=COUNT+1
+set "HAS_CLOUD=0"
+if exist "%CLOUD_CFG%" (
+    set "HAS_CLOUD=1"
+    echo   !CLOUD_INDEX!. Cloud model  [cloud_config.json]
 )
 
 if %COUNT%==0 (
-    echo [ERROR] no .gguf files in models\
-    pause
-    exit /b 1
+    if "!HAS_CLOUD!"=="0" (
+        echo [ERROR] no .gguf files in models\, and no cloud_config.json found
+        echo.
+        echo   Local:  put a GGUF file into models\
+        echo   Cloud:  copy cloud_config.example.json to cloud_config.json and fill it in
+        pause
+        exit /b 1
+    )
 )
+
+set /a MAX_CHOICE=COUNT
+if "!HAS_CLOUD!"=="1" set /a MAX_CHOICE=CLOUD_INDEX
 
 :choose_model
 echo.
 set "CHOICE="
-set /p CHOICE=Select model [1-%COUNT%]: 
+set /p CHOICE=Select model [1-%MAX_CHOICE%]: 
 
 if not defined CHOICE (
     echo [ERROR] enter a number
@@ -62,17 +68,30 @@ if not defined CHOICE (
 
 echo !CHOICE!| findstr /r "^[1-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo [ERROR] invalid, enter 1-%COUNT%
+    echo [ERROR] invalid, enter 1-%MAX_CHOICE%
     goto choose_model
 )
 
 if !CHOICE! LSS 1 (
-    echo [ERROR] out of range, enter 1-%COUNT%
+    echo [ERROR] out of range, enter 1-%MAX_CHOICE%
     goto choose_model
 )
-if !CHOICE! GTR %COUNT% (
-    echo [ERROR] out of range, enter 1-%COUNT%
+if !CHOICE! GTR %MAX_CHOICE% (
+    echo [ERROR] out of range, enter 1-%MAX_CHOICE%
     goto choose_model
+)
+
+if "!HAS_CLOUD!"=="1" (
+    if "!CHOICE!"=="!CLOUD_INDEX!" (
+        goto use_cloud
+    )
+)
+
+REM ---- local GGUF path ----
+if not exist "%BIN_DIR%\llama-server.exe" (
+    echo [ERROR] llama-server.exe not found in bin\
+    pause
+    exit /b 1
 )
 
 set "SELECTED=!MODEL_%CHOICE%!"
@@ -88,7 +107,7 @@ if not exist "!SELECTED!" (
 )
 
 echo.
-echo Selected: !SELECTED_NAME!
+echo Selected: !SELECTED_NAME! [local]
 echo URL: http://%HOST%:%PORT%
 echo.
 echo Starting llama-server ...
@@ -104,6 +123,7 @@ start "llama-server" /MIN "%BIN_DIR%\llama-server.exe" ^
   -c %CTX% ^
   --jinja
 
+set "CODER_AGENT_PROVIDER=local"
 python "%~dp0chat.py"
 set "CHAT_EXIT=!ERRORLEVEL!"
 
@@ -111,6 +131,19 @@ echo.
 echo Stopping background service...
 taskkill /F /IM llama-server.exe >nul 2>&1
 
+goto done
+
+:use_cloud
+echo.
+echo Selected: Cloud model  [cloud_config.json]
+echo.
+
+set "CODER_AGENT_PROVIDER=cloud"
+python "%~dp0chat.py"
+set "CHAT_EXIT=!ERRORLEVEL!"
+
+:done
+echo.
 echo Done.
 if not "!CHAT_EXIT!"=="0" pause
 exit /b !CHAT_EXIT!

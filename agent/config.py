@@ -7,11 +7,77 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8080
 BASE = f"http://{HOST}:{PORT}"
+
+# ========================================================================
+#  云端模型支持
+#
+#  默认走本地 llama-server（上面的 BASE）。想用云端 / 第三方 OpenAI 兼容接口
+#  （如 Ollama 云端模型、OpenAI、任意 OpenAI-compatible 网关）时：
+#    1. 复制 cloud_config.example.json 为 cloud_config.json，填好 base_url /
+#       api_key / model（该文件已在 .gitignore 里，不会被提交）。
+#    2. 用 start.bat 菜单选“云端模型”，或手动设环境变量
+#       CODER_AGENT_PROVIDER=cloud 后再跑 python chat.py。
+#
+#  PROVIDER    — "local"（默认，连本机 llama-server）或 "cloud"
+#  MODEL_NAME  — 云端接口通常需要在请求体里带 "model" 字段；本地 llama-server
+#                只服务一个已加载模型，不需要这个字段，留空则不发送
+#  API_KEY     — 云端鉴权用，本地留空
+#  CLOUD_CONFIG_ERROR — 云端模式但配置文件缺失/不完整时的错误说明，
+#                        main.py 启动时会检查并给出提示后退出
+# ========================================================================
+PROVIDER = "local"
+MODEL_NAME = ""
+API_KEY = ""
+CLOUD_CONFIG_ERROR: str | None = None
+
+CLOUD_CONFIG_PATH = Path(__file__).resolve().parent.parent / "cloud_config.json"
+
+def _load_cloud_config() -> None:
+    """若环境变量 CODER_AGENT_PROVIDER=cloud，读取 cloud_config.json 并覆盖
+    BASE / API_KEY / MODEL_NAME / PROVIDER。读取失败时不抛异常，改记录到
+    CLOUD_CONFIG_ERROR，交给 main.py 统一打印提示并退出（避免这里 import 阶段
+    直接崩掉，报错信息不友好）。
+    """
+    global BASE, PROVIDER, MODEL_NAME, API_KEY, CLOUD_CONFIG_ERROR
+
+    if os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower() != "cloud":
+        return
+
+    if not CLOUD_CONFIG_PATH.exists():
+        CLOUD_CONFIG_ERROR = (
+            f"未找到云端配置文件：{CLOUD_CONFIG_PATH}\n"
+            "  请复制 cloud_config.example.json 为 cloud_config.json 并填好 base_url / model / api_key"
+        )
+        return
+
+    try:
+        data = json.loads(CLOUD_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        CLOUD_CONFIG_ERROR = f"cloud_config.json 解析失败：{type(e).__name__}: {e}"
+        return
+
+    base_url = str(data.get("base_url", "")).strip().rstrip("/")
+    model = str(data.get("model", "")).strip()
+    api_key = str(data.get("api_key", "")).strip()
+
+    if not base_url or not model:
+        CLOUD_CONFIG_ERROR = "cloud_config.json 需要同时填写 base_url 与 model"
+        return
+
+    BASE = base_url
+    MODEL_NAME = model
+    API_KEY = api_key
+    PROVIDER = "cloud"
+
+_load_cloud_config()
 
 # 用户可输入的斜杠命令（不区分大小写，在 main 里处理）
 EXIT_CMDS = {"/exit", "/quit", "/q", "exit", "quit"}

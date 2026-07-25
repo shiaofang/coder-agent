@@ -61,10 +61,18 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stdin.reconfigure(encoding="utf-8")
 
-    # 2) 等 llama-server 就绪（start.bat 已在后台启动它）
+    # 1.5) 云端模式但配置文件缺失/不完整：提前给出友好提示再退出
+    if config.CLOUD_CONFIG_ERROR:
+        print(paint(f"✗  {config.CLOUD_CONFIG_ERROR}", C.ERR))
+        return 1
+
+    # 2) 等模型服务就绪（本地：start.bat 已在后台启动 llama-server；云端：直接跳过）
     if not wait_ready():
         print(paint(f"✗  cannot reach {BASE}", C.ERR))
         return 1
+
+    if config.PROVIDER == "cloud":
+        print(paint(f"☁ 云端模型：{config.MODEL_NAME}  ({BASE})", C.DIM, C.STATUS))
 
     # 2.5) 启动参数里给了目录就先切过去，工作目录在横幅里一起展示
     startup_dir = _startup_dir_from_argv()

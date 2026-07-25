@@ -129,6 +129,48 @@ python chat.py
 
 `agent/config.py` 里的 `HOST` / `PORT` 需与服务端一致。
 
+### 4. 云端模型（可选，不用本地 GGUF）
+
+除了本地 `llama-server`，也可以接任意 **OpenAI 兼容** 的云端 / 第三方接口（Ollama 云端模型、Ollama 云端 API、OpenAI 等）。
+
+1. 复制模板并填好信息：
+
+```bat
+copy cloud_config.example.json cloud_config.json
+```
+
+```json
+{
+  "base_url": "http://127.0.0.1:11434",
+  "model": "gpt-oss:120b-cloud",
+  "api_key": ""
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `base_url` | 接口地址，**不带** `/v1` 后缀（代码里会自动拼 `/v1/chat/completions`） |
+| `model` | 请求体里的 `model` 字段，云端接口通常需要用它选模型 |
+| `api_key` | 需要鉴权时填，会作为 `Authorization: Bearer <api_key>` 发出；不需要则留空字符串 |
+
+常见场景举例：
+
+| 场景 | `base_url` | `model` | `api_key` |
+|------|-----------|---------|-----------|
+| 本机 Ollama 转发云端模型（先 `ollama signin` + `ollama pull gpt-oss:120b-cloud`） | `http://127.0.0.1:11434` | `gpt-oss:120b-cloud` | 留空 |
+| 直连 Ollama 云端 API | `https://ollama.com` | `gpt-oss:120b-cloud` | 在 [ollama.com/settings/keys](https://ollama.com/settings/keys) 生成 |
+| OpenAI | `https://api.openai.com` | `gpt-4o` 等 | OpenAI API Key |
+
+2. `cloud_config.json` 已在 `.gitignore` 里忽略，不会被提交，可放心写真实 Key。
+3. 运行 `start.bat`，菜单里会多出一项「Cloud model」，选它即可（此时不会启动本地 `llama-server`）。也可以手动跑：
+
+```bat
+set CODER_AGENT_PROVIDER=cloud
+python chat.py
+```
+
+云端模式下不会轮询本地的 `/health`，直接发请求；若 `cloud_config.json` 缺失或缺字段，启动时会提示具体原因再退出。
+
 ## 使用说明
 
 启动后直接用自然语言下任务，例如：
@@ -185,6 +227,16 @@ python chat.py
 | `MAX_TOOL_ROUNDS` | 单轮任务最多工具调用次数 |
 | `CONFIRM_TOOLS` | 需要用户确认的工具集合 |
 | `SYSTEM_PROMPT` | 系统提示词（`prompts.py`） |
+
+**`cloud_config.json`（可选，见上方「云端模型」）**
+
+| 字段 | 含义 |
+|------|------|
+| `base_url` | 云端 / 第三方 OpenAI 兼容接口地址（不带 `/v1`） |
+| `model` | 请求体 `model` 字段 |
+| `api_key` | 鉴权用，作为 `Authorization: Bearer` 发出 |
+
+由环境变量 `CODER_AGENT_PROVIDER=cloud` 触发读取（`start.bat` 选云端选项时会自动设置）；不设置或设为其它值则走本地 `llama-server`。
 
 ## 工作原理（简要）
 

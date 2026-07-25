@@ -16,8 +16,11 @@ import time
 import urllib.request
 
 from agent.config import (
+    API_KEY,
     BASE,
     MAX_REASONING_CHARS,
+    MODEL_NAME,
+    PROVIDER,
     REASONING_LOOP_NGRAM,
     REASONING_LOOP_THRESHOLD,
 )
@@ -34,20 +37,33 @@ from agent.tools_schema import TOOLS
 #   POST /v1/chat/completions — 聊天（本程序用 stream=True 流式接收）
 #
 
+def _auth_headers(base: dict[str, str]) -> dict[str, str]:
+    """云端模式下附带 Authorization: Bearer <api_key>；本地模式不加。"""
+    if API_KEY:
+        return {**base, "Authorization": f"Bearer {API_KEY}"}
+    return base
+
 def request_json(method: str, path: str, body: dict | None = None, timeout: float = 600.0):
-    """向本地 llama-server 发 HTTP 请求，解析返回的 JSON。"""
+    """向模型服务（本地 llama-server 或云端接口）发 HTTP 请求，解析返回的 JSON。"""
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         f"{BASE}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=_auth_headers({"Content-Type": "application/json", "Accept": "application/json"}),
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 def wait_ready(retries: int = 120) -> bool:
-    """轮询 /health，等模型服务就绪；带加载动画。"""
+    """轮询 /health，等模型服务就绪；带加载动画。
+
+    云端接口一般没有 llama-server 那个 /health 端点，也不需要本机等它加载，
+    直接视为就绪即可。
+    """
+    if PROVIDER == "cloud":
+        return True
+
     frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     for i in range(retries):
         try:
@@ -94,7 +110,9 @@ def _detect_reasoning_loop(
 
 def chat_once(messages: list[dict]) -> tuple[str, list[dict], str, bool]:
     """One model turn. Returns (content, tool_calls, reasoning, looped)."""
-    # 发给本地模型的请求体：历史消息 + 工具说明书 + 流式输出
+    # 发给模型的请求体：历史消息 + 工具说明书 + 流式输出
+    # 本地 llama-server 只服务一个已加载模型，不需要 "model" 字段；
+    # 云端 / OpenAI 兼容接口通常靠这个字段选模型，MODEL_NAME 非空时才带上。
     payload = {
         "messages": messages,
         "tools": TOOLS,
@@ -102,12 +120,14 @@ def chat_once(messages: list[dict]) -> tuple[str, list[dict], str, bool]:
         "stream": True,
         "temperature": 0.3,
     }
+    if MODEL_NAME:
+        payload["model"] = MODEL_NAME
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{BASE}/v1/chat/completions",
         data=data,
         method="POST",
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        headers=_auth_headers({"Content-Type": "application/json", "Accept": "text/event-stream"}),
     )
 
     content_parts: list[str] = []

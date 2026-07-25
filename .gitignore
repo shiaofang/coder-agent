@@ -15,6 +15,9 @@ bin/
 *.dll
 *.exe
 
+# Cloud model config (contains API key) — copy from cloud_config.example.json
+cloud_config.json
+
 # IDE / OS
 .idea/
 .vscode/
