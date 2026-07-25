@@ -18,9 +18,13 @@ EXIT_CMDS = {"/exit", "/quit", "/q", "exit", "quit"}
 CLEAR_CMDS = {"/clear_cache", "/reset", "/new"}
 AUTO_CMDS = {"/auto"}
 MANUAL_CMDS = {"/manual"}
+PWD_CMDS = {"/pwd", "/dir"}
+CD_CMD = "/cd"  # 后面带参数（路径），不能放进固定集合，用前缀匹配
 
 # 输入以 / 开头时弹出的命令菜单（展示用；实际匹配仍看上面的集合）
 SLASH_MENU: list[tuple[str, str]] = [
+    ("/cd", "切换工作目录，如 /cd .. 或 /cd D:\\project"),
+    ("/pwd", "查看当前工作目录"),
     ("/clear_cache", "清空对话"),
     ("/auto", "全程自动执行"),
     ("/manual", "每次确认"),

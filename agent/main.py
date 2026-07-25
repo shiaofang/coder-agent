@@ -8,20 +8,45 @@ from __future__ import annotations
 
 import sys
 import urllib.error
+from pathlib import Path
 
 from agent import config
 from agent.config import (
     AUTO_CMDS,
     BASE,
+    CD_CMD,
     CLEAR_CMDS,
     EXIT_CMDS,
     MANUAL_CMDS,
+    PWD_CMDS,
 )
 from agent.loop import run_agent_turn
 from agent.model import wait_ready
 from agent.paths import extract_abs_paths, resolve_path, switch_cwd, _looks_like_path_input
 from agent.prompts import build_system_prompt
 from agent.terminal import C, enable_ansi, paint, print_banner, read_input
+
+def _resolve_target_dir(path_candidate: str) -> Path | None:
+    """把用户给的路径（文件或目录、相对或绝对）解析成一个可切换进去的目录；解析不到返回 None。"""
+    resolved = resolve_path(path_candidate)
+    if resolved.is_dir():
+        return resolved
+    if resolved.is_file():
+        return resolved.parent
+    return None
+
+def _startup_dir_from_argv() -> Path | None:
+    """支持启动时传一个目录参数，如 `python -m agent.main C:\\project`，
+    省得每次进来都要再手动 /cd 或拖文件夹。"""
+    if len(sys.argv) < 2:
+        return None
+    candidate = " ".join(sys.argv[1:]).strip().strip('"').strip("'")
+    if not candidate:
+        return None
+    target = _resolve_target_dir(candidate)
+    if target is None:
+        print(paint(f"⚠  启动参数不是有效路径，已忽略：{candidate}", C.ERR))
+    return target
 
 def main() -> int:
     """
@@ -41,8 +66,13 @@ def main() -> int:
         print(paint(f"✗  cannot reach {BASE}", C.ERR))
         return 1
 
+    # 2.5) 启动参数里给了目录就先切过去，工作目录在横幅里一起展示
+    startup_dir = _startup_dir_from_argv()
+    if startup_dir is not None:
+        switch_cwd(startup_dir)
+
     # 3) 欢迎横幅
-    print_banner()
+    print_banner(str(Path.cwd()))
     # 4) 对话历史：第一条永远是 system 提示词
     messages: list[dict] = [{"role": "system", "content": build_system_prompt()}]
 
@@ -61,12 +91,7 @@ def main() -> int:
         # 不当作聊天消息发给模型。
         path_candidate = user_input.strip().strip('"').strip("'")
         if _looks_like_path_input(path_candidate):
-            resolved_path = resolve_path(path_candidate)
-            target_dir = (
-                resolved_path
-                if resolved_path.is_dir()
-                else (resolved_path.parent if resolved_path.is_file() else None)
-            )
+            target_dir = _resolve_target_dir(path_candidate)
             if target_dir is not None:
                 switch_cwd(target_dir)
                 messages[0]["content"] = build_system_prompt()
@@ -90,6 +115,22 @@ def main() -> int:
             config.AUTO_APPROVE = False
             config.AUTO_APPROVE_ALWAYS = False
             print(paint("\n  ✓ 已恢复每次确认\n", C.TEAL))
+            continue
+        if cmd in PWD_CMDS:
+            print(paint(f"\n  当前工作目录：{Path.cwd()}\n", C.TEAL))
+            continue
+        if cmd == CD_CMD or cmd.startswith(CD_CMD + " "):
+            arg = user_input[len(CD_CMD):].strip().strip('"').strip("'")
+            if not arg:
+                print(paint(f"\n  当前工作目录：{Path.cwd()}\n", C.TEAL))
+                continue
+            target_dir = _resolve_target_dir(arg)
+            if target_dir is None:
+                print(paint(f"\n  ✗ 目录不存在：{resolve_path(arg)}\n", C.ERR))
+                continue
+            switch_cwd(target_dir)
+            messages[0]["content"] = build_system_prompt()
+            print(paint(f"\n  ✓ 已切换工作目录：{target_dir}\n", C.TEAL))
             continue
 
         print()

@@ -89,10 +89,10 @@ def flush_input_buffer() -> None:
     except Exception:
         pass
 
-def print_banner() -> None:
+def print_banner(cwd: str | None = None) -> None:
     """
     启动时打印一段简单的自我介绍横幅（参考 Claude Code / Codex CLI 等终端产品的欢迎框），
-    避免刚进终端时一片空白。
+    避免刚进终端时一片空白。cwd 会显示当前工作目录，方便确认 agent 到底在哪个目录下干活。
     """
     width = min(term_cols(), 72)
     inner = width - 4  # 边框 "│ " 与 " │" 共占 4 格
@@ -104,14 +104,17 @@ def print_banner() -> None:
     # 每行文字都先按当前宽度裁剪，避免窄终端下把方框撑破
     title = _truncate_display("✻ Coder Agent", inner)
     subtitle = _truncate_display("本地终端编程助手，直接读文件、改代码、跑命令、查资料", inner)
+    workdir_text = _truncate_display(f"工作目录：{cwd or os.getcwd()}", inner)
     tip1 = _truncate_display('说说想做什么，例如："帮我在这个目录创建一个 vue3 项目"', inner)
-    tip2_full = "/ 查看命令  ·  /auto 自动执行  ·  /exit 退出"
+    tip2_full = "/ 查看命令  ·  /cd 切换目录  ·  /auto 自动执行  ·  /exit 退出"
     tip2 = _truncate_display(tip2_full, inner)
 
     print()
     print(paint("╭" + "─" * (width - 2) + "╮", C.SEP))
     print(line(paint(title, C.BOLD, C.REPLY_ICON)))
     print(line(paint(subtitle, C.DIM, C.STATUS)))
+    print(line())
+    print(line(paint(workdir_text, C.DIM, C.PATH)))
     print(line())
     print(line(paint(tip1, C.DIM, C.STATUS)))
     if tip2 == tip2_full:
@@ -120,6 +123,8 @@ def print_banner() -> None:
             line(
                 paint("/", C.TEAL)
                 + paint(" 查看命令  ·  ", C.DIM, C.STATUS)
+                + paint("/cd", C.TEAL)
+                + paint(" 切换目录  ·  ", C.DIM, C.STATUS)
                 + paint("/auto", C.TEAL)
                 + paint(" 自动执行  ·  ", C.DIM, C.STATUS)
                 + paint("/exit", C.TEAL)
