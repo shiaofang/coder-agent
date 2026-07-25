@@ -39,6 +39,8 @@ def tool_call_signature(name: str, args: dict) -> str:
     """把一次工具调用压成字符串签名，用来检测「完全相同的重复操作」。"""
     if name == "edit_file":
         return f"edit|{args.get('path')}|{args.get('old_text')}|{args.get('new_text')}"
+    if name == "multi_edit":
+        return "multiedit|" + json.dumps(args.get("edits"), ensure_ascii=False, sort_keys=True)[:400]
     if name == "replace_lines":
         return (
             f"repl|{args.get('path')}|{args.get('start_line')}-"
@@ -120,7 +122,7 @@ def run_agent_turn(messages: list[dict]) -> None:
                         sig = tool_call_signature(name, args)
                         # Block identical mutating edits looping
                         if (
-                            name in {"edit_file", "replace_lines", "insert_lines", "delete_lines"}
+                            name in {"edit_file", "multi_edit", "replace_lines", "insert_lines", "delete_lines"}
                             and recent_sigs.count(sig) >= 1
                         ):
                             result = (
@@ -185,7 +187,14 @@ def run_agent_turn(messages: list[dict]) -> None:
                                     "用 edit_file/replace_lines 对文件做一次具体修改，"
                                     "再用 run_command 重新跑检查/构建看结果。"
                                 )
-                        elif name in {"edit_file", "replace_lines", "insert_lines", "delete_lines", "write_file"}:
+                        elif name in {
+                            "edit_file",
+                            "multi_edit",
+                            "replace_lines",
+                            "insert_lines",
+                            "delete_lines",
+                            "write_file",
+                        }:
                             research_call_count = 0
 
                         # 连续 grep_search（常见于无目的枚举）→ 提醒回到报错本身

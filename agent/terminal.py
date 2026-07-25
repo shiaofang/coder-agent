@@ -24,7 +24,9 @@ class C:
     SPINNER = "\033[38;5;174m"
     SPINNER_LABEL = "\033[38;5;216m"
     THINK_ICON = "\033[38;5;176m"
-    THINK_TEXT = "\033[38;5;238m\033[2m\033[3m"
+    # 之前用 238(很暗的灰) + DIM 双重变暗，很多终端主题下几乎看不清；
+    # 改成中等灰度 + 仅斜体，保持"次要文字"的观感但能看清。
+    THINK_TEXT = "\033[38;5;245m\033[3m"
     REPLY_ICON = "\033[38;5;114m"
     REPLY = "\033[38;5;252m"
     TOOL_ICON = "\033[38;5;75m"
@@ -321,6 +323,21 @@ def show_tool_call(name: str, args: dict) -> None:
         summary = f"{args.get('src')} → {args.get('dest')}"
     elif name == "run_command" and "command" in args:
         summary = str(args["command"])[:80]
+    elif name == "multi_edit":
+        edits = args.get("edits") or []
+        paths = ", ".join(dict.fromkeys(str(e.get("path", "?")) for e in edits))
+        summary = f"{len(edits)} 处修改  {paths}"[:100]
+    elif name == "write_files":
+        files = args.get("files") or []
+        paths = ", ".join(str(f.get("path", "?")) for f in files)
+        summary = f"{len(files)} 个文件  {paths}"[:100]
+    elif name == "delete_files":
+        paths = args.get("paths") or []
+        summary = f"{len(paths)} 个文件  {', '.join(str(p) for p in paths)}"[:100]
+    elif name == "check_syntax" and "path" in args:
+        summary = str(args["path"])
+    elif name in {"read_process_output", "kill_process"} and "pid" in args:
+        summary = f"pid={args.get('pid')}"
     elif name == "glob_search":
         summary = str(args.get("pattern", ""))
     elif name == "grep_search":

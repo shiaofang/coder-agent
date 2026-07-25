@@ -49,6 +49,34 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "write_files",
+            "description": (
+                "一次性创建/覆盖写入多个文件，适合「批量创建 N 个文件」的场景，"
+                "比逐个调用 write_file 更省事、也少弹几次确认。每条同 write_file 语义。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "description": "要写入的文件列表",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": f"文件路径。{PATH_HINT}"},
+                                "content": {"type": "string", "description": "文件内容，可为空字符串"},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                },
+                "required": ["files"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_file",
             "description": (
                 "精确文本替换（改几个字符/一句话首选）。old_text→new_text；"
@@ -66,6 +94,40 @@ TOOLS = [
                     },
                 },
                 "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "multi_edit",
+            "description": (
+                "一次性对多个文件/多处内容做精确替换（每条 = edit_file 的一次调用），"
+                "适合跨文件重构、批量改一个函数签名的所有调用点。逐条执行，某条失败不影响其它条，"
+                "返回里会写清第几条成功/失败。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "description": "编辑列表，按顺序依次执行",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": f"文件路径。{PATH_HINT}"},
+                                "old_text": {"type": "string", "description": "要被替换的原文（需足够独特）"},
+                                "new_text": {"type": "string", "description": "替换后的新文本"},
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "是否替换该文件内所有匹配，默认 false",
+                                },
+                            },
+                            "required": ["path", "old_text", "new_text"],
+                        },
+                    },
+                },
+                "required": ["edits"],
             },
         },
     },
@@ -129,6 +191,24 @@ TOOLS = [
                     "path": {"type": "string", "description": f"文件路径。{PATH_HINT}"},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_files",
+            "description": "一次性删除多个文件，适合「批量删除」的场景，比逐个 delete_file 更省事。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "要删除的文件路径列表",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["paths"],
             },
         },
     },
@@ -220,6 +300,60 @@ TOOLS = [
                     "cwd": {"type": "string", "description": "工作目录，可选"},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_processes",
+            "description": "列出本次会话里通过 run_command 启动的后台进程（比如 dev server），含 pid/状态/日志路径。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_process_output",
+            "description": "读取某个后台进程（pid 来自 run_command 或 list_processes）的日志输出，可只看最后 N 行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer", "description": "进程 pid"},
+                    "tail_lines": {"type": "integer", "description": "只看最后 N 行，可选，默认全部"},
+                },
+                "required": ["pid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kill_process",
+            "description": "结束某个后台进程及其子进程（比如换端口前先杀掉占用中的旧 dev server）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer", "description": "进程 pid"},
+                },
+                "required": ["pid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_syntax",
+            "description": (
+                "对单个文件做快速语法自检（.py/.json/.js/.jsx/.mjs/.cjs），"
+                "改完代码后可先用它排除低级语法错误，再跑真正的构建/测试；不支持的语言用 run_command。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": f"文件路径。{PATH_HINT}"},
+                },
+                "required": ["path"],
             },
         },
     },

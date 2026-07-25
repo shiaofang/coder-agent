@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import urllib.parse
@@ -20,6 +21,10 @@ from pathlib import Path
 from agent.config import MAX_READ_CHARS
 from agent.paths import resolve_path
 from agent.terminal import C, paint
+
+# 本次会话里通过 run_command 启动的后台进程：pid -> {proc, cmd, cwd, log_path, started_at}
+# 只在内存里维护，agent 进程退出后自然清空。
+_BG_PROCESSES: dict[int, dict] = {}
 
 def tool_read_file(
     path: str,
@@ -70,6 +75,28 @@ def tool_write_file(path: str, content: str) -> str:
         )
     return msg
 
+def tool_write_files(files: list[dict]) -> str:
+    """工具实现：一次性创建/覆盖写入多个文件，适合"批量建 N 个文件"的场景，
+    避免逐个 write_file 来回确认。每条同 write_file 语义，单条失败不影响其它条。"""
+    if not files:
+        return "ERROR: files is empty"
+    results: list[str] = []
+    ok_count = 0
+    for i, f in enumerate(files, 1):
+        if not isinstance(f, dict):
+            results.append(f"[{i}] ERROR: file item must be an object")
+            continue
+        try:
+            path = f["path"]
+        except KeyError as exc:
+            results.append(f"[{i}] ERROR: missing field {exc}")
+            continue
+        r = tool_write_file(path, f.get("content", ""))
+        results.append(f"[{i}] {path}: {r}")
+        if r.startswith("OK"):
+            ok_count += 1
+    return f"{ok_count}/{len(files)} succeeded\n" + "\n".join(results)
+
 def tool_edit_file(
     path: str,
     old_text: str,
@@ -107,6 +134,31 @@ def tool_edit_file(
         return "ERROR: no-op edit — file content unchanged after replace"
     p.write_text(new, encoding="utf-8", newline="\n")
     return f"OK: replaced {n} occurrence(s) in {p}"
+
+def tool_multi_edit(edits: list[dict]) -> str:
+    """工具实现：一次性对多个文件/多处内容做精确替换（每条同 edit_file 语义），
+    减少跨文件重构时来回调用的次数。逐条执行，某条失败不影响其它条。"""
+    if not edits:
+        return "ERROR: edits is empty"
+    results: list[str] = []
+    ok_count = 0
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict):
+            results.append(f"[{i}] ERROR: edit item must be an object")
+            continue
+        try:
+            path = e["path"]
+            old_text = e["old_text"]
+            new_text = e["new_text"]
+        except KeyError as exc:
+            results.append(f"[{i}] ERROR: missing field {exc}")
+            continue
+        r = tool_edit_file(path, old_text, new_text, bool(e.get("replace_all", False)))
+        results.append(f"[{i}] {path}: {r}")
+        if r.startswith("OK"):
+            ok_count += 1
+    summary = f"{ok_count}/{len(edits)} succeeded"
+    return summary + "\n" + "\n".join(results)
 
 def tool_replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
     """工具实现：按行号区间替换一段内容。"""
@@ -180,6 +232,20 @@ def tool_delete_file(path: str) -> str:
     p.unlink()
     return f"OK: deleted file {p}"
 
+def tool_delete_files(paths: list[str]) -> str:
+    """工具实现：一次性删除多个文件，适合"批量删文件"的场景。
+    单条失败不影响其它条（比如某个文件已经不存在）。"""
+    if not paths:
+        return "ERROR: paths is empty"
+    results: list[str] = []
+    ok_count = 0
+    for i, path in enumerate(paths, 1):
+        r = tool_delete_file(path)
+        results.append(f"[{i}] {path}: {r}")
+        if r.startswith("OK"):
+            ok_count += 1
+    return f"{ok_count}/{len(paths)} succeeded\n" + "\n".join(results)
+
 def tool_move_file(src: str, dest: str) -> str:
     """工具实现：移动或重命名文件/目录。"""
     import shutil
@@ -222,9 +288,44 @@ def tool_glob_search(pattern: str, root: str | None = None) -> str:
         return f"No matches for {pattern!r} under {base}"
     return "\n".join(matches)
 
+def _grep_with_ripgrep(pattern: str, p: Path, glob: str | None) -> str | None:
+    """尝试用 ripgrep 搜索；rg 不存在/不支持该正则时返回 None，让调用方退回 Python 实现。"""
+    if not shutil.which("rg"):
+        return None
+    cmd = ["rg", "--line-number", "--no-heading", "--with-filename", "--color=never"]
+    if glob:
+        cmd += ["--glob", glob]
+    cmd += ["-e", pattern, str(p)]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
+        )
+    except Exception:
+        return None
+    if proc.returncode == 2:
+        # 正则语法 rg（Rust regex）不认，退回 Python re 实现
+        return None
+    if proc.returncode not in (0, 1):
+        return f"ERROR: ripgrep: {(proc.stderr or proc.stdout).strip()[:300]}"
+    out = proc.stdout.strip()
+    if not out:
+        return "No matches"
+    lines = out.splitlines()
+    if len(lines) > 80:
+        lines = lines[:80] + ["...[truncated]"]
+    return "\n".join(lines)
+
 def tool_grep_search(pattern: str, path: str, glob: str | None = None) -> str:
-    """工具实现：在文件/目录中用正则搜索文本。"""
+    """工具实现：在文件/目录中搜索文本（正则）。优先用 ripgrep（更快、遵守 .gitignore），
+    不可用或语法不兼容时退回内置的 Python 实现。"""
     p = resolve_path(path)
+    if not p.exists():
+        return f"ERROR: path not found: {p}"
+
+    rg_result = _grep_with_ripgrep(pattern, p, glob)
+    if rg_result is not None:
+        return rg_result
+
     try:
         rx = re.compile(pattern)
     except re.error as e:
@@ -236,8 +337,6 @@ def tool_grep_search(pattern: str, path: str, glob: str | None = None) -> str:
     elif p.is_dir():
         files = list(p.rglob(glob or "*"))
         files = [f for f in files if f.is_file()]
-    else:
-        return f"ERROR: path not found: {p}"
 
     hits: list[str] = []
     for f in files[:500]:
@@ -334,15 +433,95 @@ def tool_run_command_background(cmd: str, work: Path, env: dict) -> str:
             f"(command exited early, not kept in background)\n{out}"
         )
 
+    _BG_PROCESSES[proc.pid] = {
+        "proc": proc,
+        "cmd": cmd,
+        "cwd": str(work),
+        "log_path": str(log_path),
+        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
     urls = re.findall(r"https?://[\w\.-]+:\d+\S*", out)
     url_hint = f"\nurl={urls[0]}" if urls else "\nurl=(check log / default http://localhost:5173)"
     return (
         f"OK: started in background\n"
         f"pid={proc.pid}\ncwd={work}{url_hint}\n"
         f"log={log_path}\n"
-        f"(dev server keeps running; do not wait for it to exit)\n"
+        f"(dev server keeps running; do not wait for it to exit; "
+        f"用 list_processes/read_process_output/kill_process 管理它)\n"
         f"--- startup log ---\n{out}"
     )
+
+def tool_list_processes() -> str:
+    """工具实现：列出本次会话里通过 run_command 启动的后台进程。"""
+    if not _BG_PROCESSES:
+        return "(no background processes)"
+    lines = []
+    for pid, info in _BG_PROCESSES.items():
+        proc = info["proc"]
+        status = "running" if proc.poll() is None else f"exited(code={proc.returncode})"
+        lines.append(
+            f"pid={pid}  {status}  started={info['started_at']}\n"
+            f"  cmd={info['cmd']}\n  cwd={info['cwd']}\n  log={info['log_path']}"
+        )
+    return "\n".join(lines)
+
+def tool_read_process_output(pid: int, tail_lines: int | None = None) -> str:
+    """工具实现：读取某个后台进程的日志；tail_lines 可只看最后 N 行。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return "ERROR: pid must be an integer"
+    info = _BG_PROCESSES.get(pid)
+    if not info:
+        return f"ERROR: no known background process with pid={pid}（先用 list_processes 查看）"
+    log_path = Path(info["log_path"])
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"ERROR: cannot read log: {e}"
+    if tail_lines:
+        lines = text.splitlines()
+        text = "\n".join(lines[-int(tail_lines):])
+    truncated_note = ""
+    if len(text) > MAX_READ_CHARS:
+        text = text[-MAX_READ_CHARS:]
+        truncated_note = "...[truncated, showing tail]\n"
+    proc = info["proc"]
+    status = "running" if proc.poll() is None else f"exited(code={proc.returncode})"
+    return f"pid={pid}  status={status}\nlog={log_path}\n\n{truncated_note}{text or '(empty log)'}"
+
+def tool_kill_process(pid: int) -> str:
+    """工具实现：结束某个后台进程（含子进程树）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return "ERROR: pid must be an integer"
+    info = _BG_PROCESSES.get(pid)
+    if not info:
+        return f"ERROR: no known background process with pid={pid}（先用 list_processes 查看）"
+    proc = info["proc"]
+    if proc.poll() is not None:
+        _BG_PROCESSES.pop(pid, None)
+        return f"OK: process {pid} had already exited (code={proc.returncode})"
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception as e:
+        return f"ERROR: failed to kill pid={pid}: {e}"
+    _BG_PROCESSES.pop(pid, None)
+    return f"OK: killed process {pid} and its child processes"
 
 def tool_run_command(command: str, cwd: str | None = None) -> str:
     """工具实现：在 shell 里执行命令；开发服务器会转后台。"""
@@ -404,6 +583,53 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
 def tool_get_datetime() -> str:
     """工具实现：返回当前本地日期时间。"""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
+
+def tool_check_syntax(path: str) -> str:
+    """工具实现：对常见语言做一次快速语法自检（不代替真正的构建/测试/lint）。
+    支持 .py / .json / .js(x) / .mjs / .cjs；其它后缀提示改用 run_command。"""
+    p = resolve_path(path)
+    if not p.is_file():
+        return f"ERROR: file not found: {p}"
+    ext = p.suffix.lower()
+
+    if ext == ".py":
+        import py_compile
+
+        try:
+            py_compile.compile(str(p), doraise=True)
+            return f"OK: {p} — no syntax errors"
+        except py_compile.PyCompileError as e:
+            return f"ERROR: {e}"
+
+    if ext == ".json":
+        try:
+            json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            return f"OK: {p} — valid JSON"
+        except json.JSONDecodeError as e:
+            return f"ERROR: invalid JSON: {e}"
+
+    if ext in {".js", ".jsx", ".mjs", ".cjs"}:
+        if not shutil.which("node"):
+            return "ERROR: node not found on PATH, cannot check JS syntax"
+        try:
+            proc = subprocess.run(
+                ["node", "--check", str(p)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            return "ERROR: node --check timed out"
+        if proc.returncode == 0:
+            return f"OK: {p} — no syntax errors"
+        return f"ERROR: {(proc.stderr or proc.stdout).strip()}"
+
+    return (
+        f"ERROR: unsupported extension {ext!r} for check_syntax "
+        "(仅支持 .py/.json/.js/.jsx/.mjs/.cjs)；"
+        "其它语言请用 run_command 跑项目自带的 build/lint/typecheck 命令"
+    )
+
 # ---------- 6.4 联网搜索与抓网页 ----------
 
 def _http_get(url: str, timeout: float = 20.0) -> str:
@@ -554,6 +780,8 @@ def execute_tool(name: str, args: dict) -> str:
             )
         if name == "write_file":
             return tool_write_file(args["path"], args.get("content", ""))
+        if name == "write_files":
+            return tool_write_files(args["files"])
         if name == "edit_file":
             return tool_edit_file(
                 args["path"],
@@ -561,6 +789,8 @@ def execute_tool(name: str, args: dict) -> str:
                 args["new_text"],
                 bool(args.get("replace_all", False)),
             )
+        if name == "multi_edit":
+            return tool_multi_edit(args["edits"])
         if name == "replace_lines":
             return tool_replace_lines(
                 args["path"],
@@ -574,6 +804,8 @@ def execute_tool(name: str, args: dict) -> str:
             return tool_delete_lines(args["path"], args["start_line"], args["end_line"])
         if name == "delete_file":
             return tool_delete_file(args["path"])
+        if name == "delete_files":
+            return tool_delete_files(args["paths"])
         if name == "move_file":
             return tool_move_file(args["src"], args["dest"])
         if name == "mkdir":
@@ -586,6 +818,14 @@ def execute_tool(name: str, args: dict) -> str:
             return tool_grep_search(args["pattern"], args["path"], args.get("glob"))
         if name == "run_command":
             return tool_run_command(args["command"], args.get("cwd"))
+        if name == "list_processes":
+            return tool_list_processes()
+        if name == "read_process_output":
+            return tool_read_process_output(args["pid"], args.get("tail_lines"))
+        if name == "kill_process":
+            return tool_kill_process(args["pid"])
+        if name == "check_syntax":
+            return tool_check_syntax(args["path"])
         if name == "web_search":
             return tool_web_search(args["query"])
         if name == "fetch_url":

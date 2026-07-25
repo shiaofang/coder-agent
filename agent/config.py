@@ -41,13 +41,17 @@ MAX_REASONING_ABORTS = 3
 # AUTO_APPROVE_ALWAYS — 全局自动（用户输入 /auto），直到 /manual
 CONFIRM_TOOLS = {
     "write_file",
+    "write_files",
     "edit_file",
+    "multi_edit",
     "replace_lines",
     "insert_lines",
     "delete_lines",
     "delete_file",
+    "delete_files",
     "move_file",
     "run_command",
+    "kill_process",
 }
 AUTO_APPROVE = False
 AUTO_APPROVE_ALWAYS = False
