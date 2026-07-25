@@ -16,10 +16,20 @@
 
 ```
 coder-agent/
-├── start.bat          # Windows 一键启动（选模型 → 起服务 → 进对话）
-├── chat.py            # 终端客户端 + Agent 工具循环
-├── bin/               # 本地自备：llama-server 及 DLL（不上传 Git）
-├── models/            # 本地自备：*.gguf 模型（不上传 Git）
+├── start.bat              # Windows 一键启动（选模型 → 起服务 → 进对话）
+├── chat.py                # 启动入口（实现在 agent/）
+├── agent/                 # 终端客户端 + Agent 工具循环
+│   ├── config.py          # 地址、命令、安全开关
+│   ├── prompts.py         # 系统提示词
+│   ├── tools_schema.py    # 给模型看的工具说明书
+│   ├── terminal.py        # 颜色、横幅、确认菜单、输入
+│   ├── paths.py           # Windows 路径解析
+│   ├── tools.py           # tool_xxx 实现 + 调度
+│   ├── model.py           # 与 llama-server 通信
+│   ├── loop.py            # 多轮工具循环
+│   └── main.py            # 主程序入口
+├── bin/                   # 本地自备：llama-server 及 DLL（不上传 Git）
+├── models/                # 本地自备：*.gguf 模型（不上传 Git）
 ├── .gitignore
 └── README.md
 ```
@@ -117,7 +127,7 @@ bin\llama-server.exe -m models\your-model.gguf --host 127.0.0.1 --port 8080 -ngl
 python chat.py
 ```
 
-`chat.py` 里的 `HOST` / `PORT` 需与服务端一致。
+`agent/config.py` 里的 `HOST` / `PORT` 需与服务端一致。
 
 ## 使用说明
 
@@ -133,7 +143,7 @@ python chat.py
 
 | 命令 | 作用 |
 |------|------|
-| `/clear` `/reset` `/new` | 清空对话上下文 |
+| `/clear_cache` `/reset` `/new` | 清空对话上下文 |
 | `/auto` | 全程自动执行写操作与命令（无需每次确认） |
 | `/manual` | 恢复每次确认 |
 | `/exit` `/quit` `/q` | 退出 |
@@ -167,22 +177,22 @@ python chat.py
 | `NGL` | `99` | GPU 卸载层数（无 GPU 可改为 `0`） |
 | `CTX` | `40000` | 上下文长度 |
 
-**`chat.py`**
+**`agent/config.py` / `agent/prompts.py`**
 
 | 常量 | 含义 |
 |------|------|
-| `HOST` / `PORT` | 客户端连接地址 |
+| `HOST` / `PORT` | 客户端连接地址（`config.py`） |
 | `MAX_TOOL_ROUNDS` | 单轮任务最多工具调用次数 |
 | `CONFIRM_TOOLS` | 需要用户确认的工具集合 |
-| `SYSTEM_PROMPT` | 系统提示词（助手行为） |
+| `SYSTEM_PROMPT` | 系统提示词（`prompts.py`） |
 
 ## 工作原理（简要）
 
 ```
 用户输入
-  → chat.py 发给本地 llama-server（/v1/chat/completions）
+  → agent 发给本地 llama-server（/v1/chat/completions）
   → 模型返回 tool_calls 或最终回复
-  → chat.py 执行工具，把结果写回 messages
+  → agent 执行工具，把结果写回 messages
   → 循环直到模型给出最终中文总结
 ```
 
