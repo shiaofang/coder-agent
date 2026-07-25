@@ -24,7 +24,7 @@ class C:
     SPINNER = "\033[38;5;174m"
     SPINNER_LABEL = "\033[38;5;216m"
     THINK_ICON = "\033[38;5;176m"
-    THINK_TEXT = "\033[38;5;245m\033[3m"
+    THINK_TEXT = "\033[38;5;238m\033[2m\033[3m"
     REPLY_ICON = "\033[38;5;114m"
     REPLY = "\033[38;5;252m"
     TOOL_ICON = "\033[38;5;75m"

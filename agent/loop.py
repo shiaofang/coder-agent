@@ -64,7 +64,8 @@ def run_agent_turn(messages: list[dict]) -> None:
 
     recent_sigs: list[str] = []
     build_error_hist: list[str] = []
-    searched_this_stuck = False
+    last_error_fp = ""  # 当前正卡住的错误指纹；换了新错误就重置下面的搜索标记
+    searched_this_error = False
     reasoning_abort_count = 0
     research_call_count = 0  # 连续 web_search/fetch_url 次数，中间没有真正去改代码
     grep_streak = 0  # 连续 grep_search 次数，用于识别"逐个属性瞎猜"
@@ -91,9 +92,9 @@ def run_agent_turn(messages: list[dict]) -> None:
                     {
                         "role": "user",
                         "content": (
-                            "[系统提示] 你刚才的思考陷入了重复循环，已被中断。"
-                            "不要再长篇分析或重复相同句子，直接给出下一步工具调用，"
-                            "或者如果已经有足够信息就直接给出简短结论。"
+                            "[系统提示] 你刚才的思考陷入重复循环，已被中断。"
+                            "禁止继续长篇分析或重复相同句子，直接给出下一步工具调用；"
+                            "如果信息已经够用，直接给出简短结论。"
                         ),
                     }
                 )
@@ -123,9 +124,9 @@ def run_agent_turn(messages: list[dict]) -> None:
                             and recent_sigs.count(sig) >= 1
                         ):
                             result = (
-                                "ERROR: LOOP — identical edit already tried. "
-                                "Do NOT repeat. Call web_search with the exact build error, "
-                                "then apply a different fix (or rewrite the broken component)."
+                                "ERROR: 重复操作 — 完全相同的编辑已经执行过一次，禁止再原样重试。"
+                                "先用 read_file 确认文件当前内容（很可能已经生效，或者 old_text/行号已经不对了），"
+                                "再决定下一步；如果是同一个报错反复修不好，才需要 web_search 报错原文换思路。"
                             )
                             show_tool_call(name, args)
                             show_tool_result(result)
@@ -150,38 +151,39 @@ def run_agent_turn(messages: list[dict]) -> None:
                             fp = extract_error_fingerprint(result)
                             if fp:
                                 build_error_hist.append(fp)
+                                if fp != last_error_fp:
+                                    last_error_fp = fp
+                                    searched_this_error = False
                                 same = sum(1 for x in build_error_hist if x == fp)
-                                if same >= 2 and not searched_this_stuck:
+                                if same >= 2 and not searched_this_error:
                                     hint = (
-                                        f"\n\nLOOP_HINT: same error seen {same} times:\n  {fp}\n"
-                                        "REQUIRED NEXT STEP: web_search(query= that error + 项目实际用的框架/库名) "
-                                        "then fetch_url a relevant result. Do not repeat the previous edit."
+                                        f"\n\nLOOP_HINT: 同一报错已经出现 {same} 次：\n  {fp}\n"
+                                        "下一步必须：web_search（查询词=这条报错原文 + 项目实际用的框架/库名），"
+                                        "再 fetch_url 打开一个相关结果；禁止重复刚才的改法。"
                                     )
                                     result = result + hint
-                                    searched_this_stuck = True
+                                    searched_this_error = True
                                 if same >= 3:
                                     hint2 = (
-                                        "\n\nESCALATE: local patches failed repeatedly. "
-                                        "Rewrite the broken file/component with a known-good pattern "
-                                        "for the project's actual framework/library, based on the web_search results "
-                                        "you already gathered — don't keep micro-tweaking the same lines."
+                                        "\n\nESCALATE: 本地小修已经反复失败。"
+                                        "请基于已经搜到的资料，用项目实际框架/库的已知正确写法"
+                                        "重写这个文件/组件里出问题的部分，禁止再对同几行做微调。"
                                     )
-                                    if hint2 not in result:
-                                        result = result + hint2
+                                    result = result + hint2
 
                         if name == "web_search":
-                            searched_this_stuck = True
+                            searched_this_error = True
 
-                        # 连续搜索/抓取但一直不落地改代码 → 强制收敛，别再换个说法接着搜
+                        # 搜索/抓取次数堆积但一直没落地改代码 → 强制收敛，别再换个说法接着搜
                         if name in {"web_search", "fetch_url"}:
                             research_call_count += 1
                             if research_call_count >= 3:
                                 result = result + (
-                                    "\n\nSTOP_SEARCHING: 你这一轮已经连续调用了 "
-                                    f"{research_call_count} 次 web_search/fetch_url，还没有真正去改代码。"
-                                    "不要再搜索或换个说法重新搜索，直接根据目前已经拿到的信息"
-                                    "用 edit_file/replace_lines "
-                                    "对文件做一次具体修改，然后用 run_command 重新跑检查/构建看结果。"
+                                    f"\n\nSTOP_SEARCHING: 已经调用了 {research_call_count} 次 "
+                                    "web_search/fetch_url，还没有真正改代码。"
+                                    "禁止再搜索或换个说法重新搜索，必须直接根据已拿到的信息"
+                                    "用 edit_file/replace_lines 对文件做一次具体修改，"
+                                    "再用 run_command 重新跑检查/构建看结果。"
                                 )
                         elif name in {"edit_file", "replace_lines", "insert_lines", "delete_lines", "write_file"}:
                             research_call_count = 0
@@ -191,10 +193,9 @@ def run_agent_turn(messages: list[dict]) -> None:
                             grep_streak += 1
                             if grep_streak >= 3:
                                 result = result + (
-                                    "\n\nSTOP_GUESSING: 你连续用 grep_search 了 "
-                                    f"{grep_streak} 次，这是在瞎猜。"
-                                    "请回到报错信息里的文件名/行号/标识符，用 read_file 读上下文，"
-                                    "或 web_search 搜完整报错；不要再无目的地枚举关键词。"
+                                    f"\n\nSTOP_GUESSING: 已经连续 {grep_streak} 次 grep_search，这是在瞎猜。"
+                                    "禁止再无目的枚举关键词；必须回到报错信息里的文件名/行号/标识符，"
+                                    "用 read_file 读上下文，或 web_search 搜完整报错原文。"
                                 )
                         else:
                             grep_streak = 0
