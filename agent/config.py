@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import re
+
 HOST = "127.0.0.1"
 PORT = 8080
 BASE = f"http://{HOST}:{PORT}"
@@ -55,3 +57,30 @@ CONFIRM_TOOLS = {
 }
 AUTO_APPROVE = False
 AUTO_APPROVE_ALWAYS = False
+
+# run_command 命令一旦含这些符号就不算「一望而知只读」，仍需确认——
+# 防止用安全命令开头、后面拼接删改操作（如 "dir & del file" / "cat a > b"）。
+_DANGEROUS_CMD_TOKENS_RE = re.compile(r"[|;&`]|\$\(|<|>")
+
+# 明确只读、不改动任何东西的查看类命令前缀：run_command 里跑这些可以免确认，
+# 避免「查文件在不在/看内容」这类只读检查还要用户手动点一下。
+SAFE_READONLY_CMD_PREFIXES = (
+    "dir", "ls", "ll", "type", "cat", "more", "less", "tree", "where", "which",
+    "pwd", "whoami", "hostname", "ver", "date", "time",
+    "git status", "git diff", "git log", "git branch", "git show", "git remote",
+    "node -v", "node --version", "python -v", "python -V", "python --version",
+    "python3 --version", "npm -v", "npm --version", "npm list", "npm ls",
+    "pip show", "pip list", "pip --version", "pip3 --version",
+)
+
+def is_safe_readonly_command(command: str) -> bool:
+    """判断 run_command 里的命令是否明显只读（查看/确认类），可以免用户确认。
+
+    要求：不含管道/重定向/命令链接等符号，且命令以已知只读命令开头。
+    只做保守白名单匹配，不识别的一律走原来的确认流程。
+    """
+    cmd = (command or "").strip()
+    if not cmd or _DANGEROUS_CMD_TOKENS_RE.search(cmd):
+        return False
+    low = cmd.lower()
+    return any(low == p or low.startswith(p + " ") for p in SAFE_READONLY_CMD_PREFIXES)

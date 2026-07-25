@@ -360,6 +360,42 @@ def prepare_command(command: str) -> str:
     if re.match(r"^npm\s+create\b", cmd, re.I) and "--yes" not in cmd:
         cmd = re.sub(r"^npm\s+create\b", "npm create --yes", cmd, count=1, flags=re.I)
     return cmd
+
+if os.name == "nt":
+    import ctypes
+
+    def _windows_legacy_cp() -> str | None:
+        """cmd.exe 内置命令（dir/tree/systeminfo 等）在输出被重定向（非真实控制台）时，
+        是按系统 OEM 代码页（中文系统通常是 936=GBK）编码文本的，chcp 对重定向输出不起作用。
+        查询真实的 OEM 代码页，供解码回退使用。"""
+        try:
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:
+            return None
+else:
+    def _windows_legacy_cp() -> str | None:
+        return None
+
+def decode_subprocess_output(raw: bytes) -> str:
+    """把子进程输出的原始字节解码成字符串。
+
+    现代 CLI（git/node/npm/python…）大多直接写 UTF-8 字节，优先按 UTF-8 严格解码；
+    只有解码失败时才回退到 Windows 的 OEM 代码页（修复 dir 等内置命令中文乱码导致模型
+    看不懂输出、反复重跑同一条命令“确认”的问题），非 Windows 或探测失败则退回
+    UTF-8（errors=replace）。"""
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    legacy_cp = _windows_legacy_cp()
+    if legacy_cp:
+        try:
+            return raw.decode(legacy_cp)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return raw.decode("utf-8", errors="replace")
 LONG_RUNNING_PATTERNS = [
     r"npm\s+run\s+dev\b",
     r"npm\s+run\s+start\b",
@@ -388,7 +424,9 @@ def tool_run_command_background(cmd: str, work: Path, env: dict) -> str:
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 
     log_path = work / ".coder-dev-server.log"
-    log_f = open(log_path, "w", encoding="utf-8", errors="replace")
+    # 二进制模式：子进程直接写入这个文件描述符，不经过 Python 的文本编码层，
+    # 用 "w"+encoding 会让人误以为写入内容是 UTF-8，实际取决于子进程自己的编码。
+    log_f = open(log_path, "wb")
     try:
         proc = subprocess.Popen(
             cmd,
@@ -410,7 +448,7 @@ def tool_run_command_background(cmd: str, work: Path, env: dict) -> str:
     while time.time() < deadline:
         time.sleep(0.4)
         try:
-            out = log_path.read_text(encoding="utf-8", errors="replace")
+            out = decode_subprocess_output(log_path.read_bytes())
         except OSError:
             out = ""
         if re.search(r"Local:\s*https?://|localhost:\d+|ready in|Network:", out, re.I):
@@ -477,7 +515,7 @@ def tool_read_process_output(pid: int, tail_lines: int | None = None) -> str:
         return f"ERROR: no known background process with pid={pid}（先用 list_processes 查看）"
     log_path = Path(info["log_path"])
     try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        text = decode_subprocess_output(log_path.read_bytes())
     except OSError as e:
         return f"ERROR: cannot read log: {e}"
     if tail_lines:
@@ -560,9 +598,6 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
             shell=True,
             cwd=str(work),
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=180,
             stdin=subprocess.DEVNULL,
             env=env,
@@ -573,7 +608,9 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
             "If this is a dev server, it should be detected as background; "
             "otherwise use non-interactive flags."
         )
-    out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+    stdout = decode_subprocess_output(proc.stdout)
+    stderr = decode_subprocess_output(proc.stderr)
+    out = (stdout or "") + (("\n" + stderr) if stderr else "")
     out = out.strip() or "(no output)"
     if len(out) > 12_000:
         out = out[:12_000] + "\n...[truncated]"

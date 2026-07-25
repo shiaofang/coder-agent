@@ -11,7 +11,7 @@ import re
 import sys
 
 from agent import config
-from agent.config import CONFIRM_TOOLS, SLASH_MENU
+from agent.config import CONFIRM_TOOLS, SLASH_MENU, is_safe_readonly_command
 
 class C:
     RESET = "\033[0m"
@@ -233,6 +233,9 @@ def _read_key() -> str:
 def ask_tool_approval(name: str, args: dict) -> bool:
     """↑↓ 选择，Enter 确认。返回 True 表示允许执行。"""
     if name not in CONFIRM_TOOLS:
+        return True
+    if name == "run_command" and is_safe_readonly_command(str(args.get("command", ""))):
+        print(paint("  ⎿  ", C.DIM) + paint("只读命令，自动放行", C.DIM, C.TEAL))
         return True
     if config.AUTO_APPROVE_ALWAYS or config.AUTO_APPROVE:
         print(paint("  ⎿  ", C.DIM) + paint("自动执行中", C.DIM, C.TEAL))

@@ -13,7 +13,7 @@ SYSTEM_PROMPT = """
 
 路径：用户给的绝对路径必须原样传给工具，禁止改成相对路径。
 
-定位：动手前先用 grep_search / glob_search / list_dir / read_file 确认文件真实存在、内容真实如此，禁止凭猜测的文件名或行号直接改。
+定位：动手前先用 grep_search / glob_search / list_dir / read_file 确认文件真实存在、内容真实如此，禁止凭猜测的文件名或行号直接改。查文件在不在、看文件内容，优先用 list_dir / read_file，不要用 run_command 跑 dir/ls/type/cat 之类命令来做——前者不用用户确认，后者会打断用户手动确认一次。
 
 命令：禁止编造不存在的 CLI 参数或工具。不确定先 --help 或 web_search 查文档。
 
