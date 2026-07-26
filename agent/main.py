@@ -25,6 +25,7 @@ from agent.model import wait_ready
 from agent.paths import extract_abs_paths, resolve_path, switch_cwd, _looks_like_path_input
 from agent.prompts import build_system_prompt
 from agent.terminal import C, enable_ansi, paint, print_banner, read_input
+from agent.tools import clear_todos
 
 def _resolve_target_dir(path_candidate: str) -> Path | None:
     """把用户给的路径（文件或目录、相对或绝对）解析成一个可切换进去的目录；解析不到返回 None。"""
@@ -117,6 +118,7 @@ def main() -> int:
         if cmd in CLEAR_CMDS:
             messages = [{"role": "system", "content": build_system_prompt()}]
             config.AUTO_APPROVE = False
+            clear_todos()
             print(paint("\n  ✓ conversation cleared\n", C.TEAL))
             continue
         if cmd in AUTO_CMDS:

@@ -398,4 +398,65 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": (
+                "创建或更新本会话的任务计划清单。多步骤任务开始时先调用一次写出全部步骤；"
+                "每完成一步再 merge 更新对应项的 status。"
+                "每项必须有 content（步骤说明）和 status；id 建议用 1/2/3。"
+                "示例参数："
+                '{"todos":[{"id":"1","content":"创建目录","status":"in_progress"},'
+                '{"id":"2","content":"写 hello.txt","status":"pending"}],"merge":false}'
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": (
+                            "todo 对象数组。每项字段：id（字符串）、content（步骤说明，必填）、"
+                            "status（pending|in_progress|completed|cancelled）。"
+                            "也接受 task/title 作为 content 的别名。"
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "稳定 id，如 \"1\"、\"2\"、\"setup\"",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "这一步要做什么（简短中文/英文均可）",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "description": "pending | in_progress | completed | cancelled",
+                                },
+                            },
+                            "required": ["id", "content", "status"],
+                        },
+                    },
+                    "merge": {
+                        "type": "boolean",
+                        "description": (
+                            "false=整表替换（第一次建计划用）；"
+                            "true=按 id 合并更新（默认；推进进度时用，可只传 id+status）"
+                        ),
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_read",
+            "description": "读取当前会话的任务计划清单（进度回顾时用）。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]

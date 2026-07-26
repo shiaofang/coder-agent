@@ -622,6 +622,188 @@ def tool_get_datetime() -> str:
     """工具实现：返回当前本地日期时间。"""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
 
+
+# ========================================================================
+#  Todo / 计划清单（会话内内存，/clear_cache 时清空）
+# ========================================================================
+
+_TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
+# 每项: {"id": str, "content": str, "status": str}
+_TODOS: list[dict[str, str]] = []
+
+
+def clear_todos() -> None:
+    """清空会话内 todo（main 在 /clear_cache 时调用）。"""
+    _TODOS.clear()
+
+
+def _format_todos() -> str:
+    if not _TODOS:
+        return "(empty todo list)"
+    lines: list[str] = []
+    for t in _TODOS:
+        mark = {
+            "pending": "[ ]",
+            "in_progress": "[>]",
+            "completed": "[x]",
+            "cancelled": "[-]",
+        }.get(t["status"], "[?]")
+        lines.append(f"{mark} {t['id']}: {t['content']}  ({t['status']})")
+    in_prog = sum(1 for t in _TODOS if t["status"] == "in_progress")
+    done = sum(1 for t in _TODOS if t["status"] == "completed")
+    header = f"todos={len(_TODOS)}  in_progress={in_prog}  completed={done}"
+    return header + "\n" + "\n".join(lines)
+
+
+def tool_todo_read() -> str:
+    """返回当前会话的计划清单。"""
+    return "OK:\n" + _format_todos()
+
+
+_TODO_CONTENT_KEYS = ("content", "task", "text", "title", "description", "name")
+_TODO_EXAMPLE = (
+    '{"todos":[{"id":"1","content":"创建目录","status":"in_progress"},'
+    '{"id":"2","content":"写文件","status":"pending"}],"merge":false}'
+)
+
+
+def _todo_pick_content(raw: dict) -> str:
+    """兼容模型常用的 content/task/title 等字段名。"""
+    for key in _TODO_CONTENT_KEYS:
+        val = raw.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _todo_coerce_item(raw: object, index: int) -> dict | str:
+    """把一项 todo 收成 dict；失败时返回错误说明字符串。"""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return f"ERROR: todos[{index}] 是空字符串"
+        return {
+            "id": str(index + 1),
+            "content": text,
+            "status": "pending",
+        }
+    if not isinstance(raw, dict):
+        return (
+            f"ERROR: todos[{index}] 必须是对象（含 id/content/status），"
+            f"不能是 {type(raw).__name__}。示例：{_TODO_EXAMPLE}"
+        )
+
+    # 允许 id 用数字
+    tid = raw.get("id")
+    if tid is None or str(tid).strip() == "":
+        tid = str(index + 1)
+    else:
+        tid = str(tid).strip()
+
+    content = _todo_pick_content(raw)
+    status = str(raw.get("status") or "pending").strip().lower()
+    # 常见同义词
+    aliases = {
+        "done": "completed",
+        "complete": "completed",
+        "finished": "completed",
+        "doing": "in_progress",
+        "progress": "in_progress",
+        "working": "in_progress",
+        "todo": "pending",
+        "open": "pending",
+        "cancel": "cancelled",
+        "canceled": "cancelled",
+    }
+    status = aliases.get(status, status)
+    return {"id": tid, "content": content, "status": status}
+
+
+def tool_todo_write(todos: list, merge: bool = True) -> str:
+    """创建或更新计划清单。
+
+    merge=true（默认）：按 id 合并；已有项可只改 status/content；新 id 追加。
+    merge=false：用本次列表整体替换。
+    同一时刻最多 1 个 in_progress（多了会自动只保留第一个，其余改回 pending）。
+    """
+    # 模型有时把整个 todos 误传成 JSON 字符串
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            return (
+                "ERROR: todos 必须是数组。示例："
+                + _TODO_EXAMPLE
+            )
+    if not isinstance(todos, list) or not todos:
+        return "ERROR: todos 必须是非空数组。示例：" + _TODO_EXAMPLE
+
+    # 空清单时 merge 无意义，按整表替换处理，减少第一次调用踩坑
+    if not _TODOS:
+        merge = False
+
+    normalized: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for i, raw in enumerate(todos):
+        item = _todo_coerce_item(raw, i)
+        if isinstance(item, str):
+            return item
+        tid = item["id"]
+        content = item["content"]
+        status = item["status"]
+        if tid in seen_ids:
+            return f"ERROR: 重复的 id: {tid}"
+        seen_ids.add(tid)
+        if status not in _TODO_STATUSES:
+            return (
+                f"ERROR: todos[{i}].status 无效: {status}；"
+                f"允许: {', '.join(_TODO_STATUSES)}"
+            )
+        # 新建项缺 content 时，用 id 兜底，避免模型反复重试
+        if not content and (not merge or tid not in {t["id"] for t in _TODOS}):
+            content = tid
+        normalized.append({"id": tid, "content": content, "status": status})
+
+    if merge:
+        by_id = {t["id"]: dict(t) for t in _TODOS}
+        order = [t["id"] for t in _TODOS]
+        for item in normalized:
+            old = by_id.get(item["id"])
+            if old:
+                if not item["content"]:
+                    item["content"] = old["content"]
+                by_id[item["id"]] = item
+            else:
+                if not item["content"]:
+                    item["content"] = item["id"]
+                by_id[item["id"]] = item
+                order.append(item["id"])
+        _TODOS[:] = [by_id[i] for i in order if i in by_id]
+    else:
+        for item in normalized:
+            if not item["content"]:
+                item["content"] = item["id"]
+        _TODOS[:] = normalized
+
+    in_prog_ids = [t["id"] for t in _TODOS if t["status"] == "in_progress"]
+    note = ""
+    if len(in_prog_ids) > 1:
+        keep = in_prog_ids[0]
+        for t in _TODOS:
+            if t["status"] == "in_progress" and t["id"] != keep:
+                t["status"] = "pending"
+        note = f"\nNOTE: 同时只能有 1 个 in_progress，已保留 {keep}，其余改回 pending。"
+    elif not in_prog_ids and any(t["status"] == "pending" for t in _TODOS):
+        # 首次建计划若全是 pending，自动把第一项标成进行中，减少多一轮调用
+        for t in _TODOS:
+            if t["status"] == "pending":
+                t["status"] = "in_progress"
+                note = f"\nNOTE: 已自动将 {t['id']} 标为 in_progress。"
+                break
+
+    return "OK:\n" + _format_todos() + note
+
+
 def tool_check_syntax(path: str) -> str:
     """工具实现：对常见语言做一次快速语法自检（不代替真正的构建/测试/lint）。
     支持 .py / .json / .js(x) / .mjs / .cjs；其它后缀提示改用 run_command。"""

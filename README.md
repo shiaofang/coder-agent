@@ -23,6 +23,7 @@ coder-agent/
 ├── agent/                 # 终端客户端 + Agent 工具循环
 │   ├── config.py          # 读取 config.json、斜杠命令、安全开关
 │   ├── prompts.py         # 系统提示词
+│   ├── project_context.py # 扫描 cwd 注入项目上下文
 │   ├── tools_schema.py    # 给模型看的工具说明书
 │   ├── terminal.py        # 颜色、横幅、确认菜单、输入
 │   ├── paths.py           # Windows 路径解析
@@ -213,7 +214,10 @@ python chat.py
 | `glob_search` / `grep_search` | 按路径模式 / 正则搜索 |
 | `run_command` | 执行 shell；常驻服务自动后台 |
 | `web_search` / `fetch_url` | 联网搜索（Tavily）与抓取正文 |
+| `todo_write` / `todo_read` | 多步骤任务计划清单（会话内） |
 | `get_datetime` | 当前本地时间 |
+
+启动与 `/cd` 时会把当前目录的项目上下文注入 system 提示（`AGENTS.md` / `.cursorrules`、`package.json` scripts、git status、README 节选等），见 `agent/project_context.py`。
 
 ### 联网搜索（`web_search`）
 

@@ -160,12 +160,36 @@ def _truncate_display(text: str, max_w: int) -> str:
         out = out[:-1]
     return (out + "…") if out else "…"
 
+# 粘贴/组合键时来不及处理的按键，下一次 _read_input_key 优先消费
+_KEY_QUEUE: list[tuple[str, str]] = []
+
+
+def _classify_key_char(ch: str) -> tuple[str, str]:
+    """把单个字符映射成 (kind, value)，与 _read_input_key 约定一致。"""
+    if ch in ("\r", "\n"):
+        return ("enter", "")
+    if ch == "\x1b":
+        return ("esc", "")
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    if ch in ("\x08", "\x7f"):
+        return ("backspace", "")
+    if ch == "\t":
+        return ("tab", "")
+    if ch >= " " and ch != "\x7f":
+        return ("char", ch)
+    return ("other", "")
+
+
 def _read_input_key() -> tuple[str, str]:
     """
     读一个按键。返回 (kind, value)：
       up/down/enter/esc/backspace/tab  → value 为空
       char → value 为字符
     """
+    if _KEY_QUEUE:
+        return _KEY_QUEUE.pop(0)
+
     if os.name == "nt":
         import msvcrt
 
@@ -181,19 +205,7 @@ def _read_input_key() -> tuple[str, str]:
             if ch2 == "M":  # right — ignore
                 return ("other", "")
             return ("other", "")
-        if ch in ("\r", "\n"):
-            return ("enter", "")
-        if ch == "\x1b":
-            return ("esc", "")
-        if ch == "\x03":
-            raise KeyboardInterrupt
-        if ch in ("\x08", "\x7f"):
-            return ("backspace", "")
-        if ch == "\t":
-            return ("tab", "")
-        if ch >= " " and ch != "\x7f":
-            return ("char", ch)
-        return ("other", "")
+        return _classify_key_char(ch)
 
     import termios
     import tty
@@ -210,19 +222,98 @@ def _read_input_key() -> tuple[str, str]:
             if rest == "[B":
                 return ("down", "")
             return ("esc", "")
-        if ch in ("\r", "\n"):
-            return ("enter", "")
-        if ch == "\x03":
-            raise KeyboardInterrupt
-        if ch in ("\x7f", "\x08"):
-            return ("backspace", "")
-        if ch == "\t":
-            return ("tab", "")
-        if ch >= " ":
-            return ("char", ch)
-        return ("other", "")
+        return _classify_key_char(ch)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _drain_paste_chars(first: str) -> str:
+    """粘贴时一次读完缓冲区里后续字符，避免每字整屏重绘。
+
+    遇到 Enter/退格/方向键等非普通字符时停止，并放进 _KEY_QUEUE。
+    单行输入里把粘贴中的换行当成空格，避免半截提交。
+    """
+    parts = [first]
+    if os.name == "nt":
+        import msvcrt
+
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                ch2 = msvcrt.getwch() if msvcrt.kbhit() else ""
+                if ch2 == "H":
+                    _KEY_QUEUE.append(("up", ""))
+                elif ch2 == "P":
+                    _KEY_QUEUE.append(("down", ""))
+                else:
+                    _KEY_QUEUE.append(("other", ""))
+                break
+            if ch in ("\r", "\n"):
+                # 粘贴块中间的换行 → 空格；若后面没有更多字符，当作真正的 Enter
+                if msvcrt.kbhit():
+                    parts.append(" ")
+                    continue
+                _KEY_QUEUE.append(("enter", ""))
+                break
+            kind, val = _classify_key_char(ch)
+            if kind == "char":
+                parts.append(val)
+                continue
+            _KEY_QUEUE.append((kind, val))
+            break
+        return "".join(parts)
+
+    # POSIX：非阻塞尽量多读
+    try:
+        import select
+
+        fd = sys.stdin.fileno()
+        while select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            if ch == "\x1b":
+                _KEY_QUEUE.append(("esc", ""))
+                break
+            if ch in ("\r", "\n"):
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    parts.append(" ")
+                    continue
+                _KEY_QUEUE.append(("enter", ""))
+                break
+            kind, val = _classify_key_char(ch)
+            if kind == "char":
+                parts.append(val)
+                continue
+            _KEY_QUEUE.append((kind, val))
+            break
+    except Exception:
+        pass
+    return "".join(parts)
+
+
+def _prompt_prefix_width() -> int:
+    """提示符「❯ 」的显示宽度。"""
+    return _status_text_width("❯ ")
+
+
+def _input_display_rows(buf: str) -> int:
+    """输入行（提示符 + 文本）在当前终端会占几行（含自动折行）。"""
+    cols = max(1, term_cols())
+    width = _prompt_prefix_width() + _status_text_width(buf)
+    if width <= 0:
+        return 1
+    return max(1, (width - 1) // cols + 1)
+
+
+def _cursor_col_after_input(buf: str) -> int:
+    """输入末尾所在列（1-based，供 ANSI CUP 使用）。"""
+    cols = max(1, term_cols())
+    width = _prompt_prefix_width() + _status_text_width(buf)
+    if width <= 0:
+        return 1
+    col = width % cols
+    return cols if col == 0 else col
 
 def _read_key() -> str:
     """工具确认菜单用：up / down / enter / esc / 1 / 2 / other"""
@@ -354,6 +445,17 @@ def show_tool_call(name: str, args: dict) -> None:
         summary = str(args.get("query", ""))[:80]
     elif name == "fetch_url":
         summary = str(args.get("url", ""))[:80]
+    elif name == "todo_write":
+        items = args.get("todos") or []
+        merge = args.get("merge", True)
+        mode = "merge" if merge else "replace"
+        summary = f"{len(items)} 项  ({mode})"
+        # 显示当前要推进的那一步
+        for it in items:
+            if isinstance(it, dict) and it.get("status") == "in_progress":
+                summary += f"  → {it.get('content') or it.get('id')}"
+                break
+        summary = summary[:100]
     label = f"{name}" + (f"  {summary}" if summary else "")
     print(paint("●", C.TOOL_ICON) + " " + paint(label, C.BOLD, C.TOOL_ICON))
     if name == "write_file" and "content" in args:
@@ -423,6 +525,9 @@ def read_input() -> str:
     menu_idx = 0
     menu_suppressed = False
     menu_count = 0  # 当前悬浮菜单行数
+    # 光标相对输入块首行向下偏移（0=首行）。菜单在下方时也会把光标移回输入末尾，
+    # 清屏按此上移后用 \033[J 顺带清掉下面的菜单。
+    cursor_row_offset = 0
 
     def matches() -> list[tuple[str, str]]:
         if not buf.startswith("/"):
@@ -430,15 +535,18 @@ def read_input() -> str:
         return _slash_matches(buf)
 
     def clear_float() -> None:
-        """清掉输入行及下方悬浮菜单，光标回到行首。"""
-        nonlocal menu_count
+        """清掉输入块（含自动折行）及下方悬浮菜单。"""
+        nonlocal menu_count, cursor_row_offset
+        if cursor_row_offset > 0:
+            sys.stdout.write(f"\033[{cursor_row_offset}A")
         sys.stdout.write("\r\033[J")
         sys.stdout.flush()
         menu_count = 0
+        cursor_row_offset = 0
 
     def render() -> None:
         """重绘输入行，菜单画在下方后把光标移回输入末尾。"""
-        nonlocal menu_idx, menu_count
+        nonlocal menu_idx, menu_count, cursor_row_offset
         clear_float()
 
         items = matches()
@@ -448,6 +556,8 @@ def read_input() -> str:
 
         prompt = paint("❯", C.PROMPT) + " " + paint(buf, C.USER_FG)
         sys.stdout.write(prompt)
+        input_rows = _input_display_rows(buf)
+        cursor_row_offset = max(0, input_rows - 1)
 
         if show_menu:
             for i, (cmd, hint) in enumerate(items):
@@ -465,16 +575,17 @@ def read_input() -> str:
                     )
                 sys.stdout.write("\n\033[2K" + line)
             menu_count = len(items)
-            # 回到输入行，光标落在 buf 末尾（❯ + 空格 + buf）
-            col = 1 + _visible_cols("❯ ") + _visible_cols(buf)
-            sys.stdout.write(f"\033[{menu_count}A\033[{col}G")
+            # 回到输入末尾所在行与列（考虑折行）
+            sys.stdout.write(f"\033[{menu_count}A")
+            col = _cursor_col_after_input(buf)
+            sys.stdout.write(f"\033[{col}G")
         else:
             menu_count = 0
 
         sys.stdout.flush()
 
     def finish(text: str) -> str:
-        """提交：清掉悬浮层，留下一行最终输入。"""
+        """提交：清掉悬浮层，留下最终输入（过长时仍可能折行）。"""
         clear_float()
         sys.stdout.write(paint("❯", C.PROMPT) + " " + paint(text, C.USER_FG) + "\n")
         sys.stdout.flush()
@@ -519,9 +630,10 @@ def read_input() -> str:
                 render()
                 continue
             if kind == "char":
-                if not buf and val.isspace():
+                chunk = _drain_paste_chars(val)
+                if not buf and chunk.isspace():
                     continue
-                buf += val
+                buf += chunk
                 menu_idx = 0
                 menu_suppressed = False
                 render()
