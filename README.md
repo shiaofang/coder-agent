@@ -18,8 +18,10 @@
 coder-agent/
 ├── start.bat              # Windows 一键启动（选模型 → 起服务 → 进对话）
 ├── chat.py                # 启动入口（实现在 agent/）
+├── config.example.json    # 配置模板（复制为 config.json）
+├── config.json            # 运行时配置（含 Key，不上传 Git）
 ├── agent/                 # 终端客户端 + Agent 工具循环
-│   ├── config.py          # 地址、命令、安全开关
+│   ├── config.py          # 读取 config.json、斜杠命令、安全开关
 │   ├── prompts.py         # 系统提示词
 │   ├── tools_schema.py    # 给模型看的工具说明书
 │   ├── terminal.py        # 颜色、横幅、确认菜单、输入
@@ -127,33 +129,38 @@ bin\llama-server.exe -m models\your-model.gguf --host 127.0.0.1 --port 8080 -ngl
 python chat.py
 ```
 
-`agent/config.py` 里的 `HOST` / `PORT` 需与服务端一致。
+本地模式下 `config.json` 的 `host` / `port` 需与 `start.bat` 里启动的 llama-server 一致。
 
-### 4. 云端模型（可选，不用本地 GGUF）
+### 4. 统一配置文件 `config.json`
 
-除了本地 `llama-server`，也可以接任意 **OpenAI 兼容** 的云端 / 第三方接口（Ollama 云端模型、Ollama 云端 API、OpenAI 等）。
-
-1. 复制模板并填好信息：
+运行时配置（模型、搜索 Key 等）全部放在项目根目录的 **`config.json`**（已 gitignore）。复制模板：
 
 ```bat
-copy cloud_config.example.json cloud_config.json
+copy config.example.json config.json
 ```
 
 ```json
 {
-  "base_url": "http://127.0.0.1:11434",
+  "provider": "cloud",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "base_url": "https://ollama.com",
   "model": "gpt-oss:120b-cloud",
-  "api_key": ""
+  "api_key": "",
+  "tavily_api_key": ""
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
-| `base_url` | 接口地址，**不带** `/v1` 后缀（代码里会自动拼 `/v1/chat/completions`） |
-| `model` | 请求体里的 `model` 字段，云端接口通常需要用它选模型 |
-| `api_key` | 需要鉴权时填，会作为 `Authorization: Bearer <api_key>` 发出；不需要则留空字符串 |
+| `provider` | `local`（本机 llama-server）或 `cloud`（OpenAI 兼容接口）；可被环境变量 `CODER_AGENT_PROVIDER` / `start.bat` 菜单覆盖 |
+| `host` / `port` | 本地 llama-server 地址（`provider=local` 时使用） |
+| `base_url` | 云端接口地址，**不带** `/v1`（代码会拼 `/v1/chat/completions`） |
+| `model` | 请求体里的 `model`；云端通常必填 |
+| `api_key` | 云端鉴权，作为 `Authorization: Bearer`；不需要则留空 |
+| `tavily_api_key` | Tavily 搜索 Key；也可用环境变量 `TAVILY_API_KEY` |
 
-常见场景举例：
+常见云端场景：
 
 | 场景 | `base_url` | `model` | `api_key` |
 |------|-----------|---------|-----------|
@@ -161,15 +168,16 @@ copy cloud_config.example.json cloud_config.json
 | 直连 Ollama 云端 API | `https://ollama.com` | `gpt-oss:120b-cloud` | 在 [ollama.com/settings/keys](https://ollama.com/settings/keys) 生成 |
 | OpenAI | `https://api.openai.com` | `gpt-4o` 等 | OpenAI API Key |
 
-2. `cloud_config.json` 已在 `.gitignore` 里忽略，不会被提交，可放心写真实 Key。
-3. 运行 `start.bat`，菜单里会多出一项「Cloud model」，选它即可（此时不会启动本地 `llama-server`）。也可以手动跑：
+`start.bat` 菜单里选「Cloud model」会设 `CODER_AGENT_PROVIDER=cloud`（此时不启本地 llama-server）。也可手动：
 
 ```bat
 set CODER_AGENT_PROVIDER=cloud
 python chat.py
 ```
 
-云端模式下不会轮询本地的 `/health`，直接发请求；若 `cloud_config.json` 缺失或缺字段，启动时会提示具体原因再退出。
+或直接在 `config.json` 写 `"provider": "cloud"` 后 `python chat.py`。云端模式不轮询本地 `/health`；配置缺失或缺字段时启动会提示原因并退出。
+
+若仍有旧的 `cloud_config.json`，请重命名为 `config.json`。
 
 ## 使用说明
 
@@ -204,39 +212,41 @@ python chat.py
 | `delete_file` / `move_file` / `mkdir` / `list_dir` | 文件与目录操作 |
 | `glob_search` / `grep_search` | 按路径模式 / 正则搜索 |
 | `run_command` | 执行 shell；常驻服务自动后台 |
-| `web_search` / `fetch_url` | 联网搜索与抓取正文 |
+| `web_search` / `fetch_url` | 联网搜索（Tavily）与抓取正文 |
 | `get_datetime` | 当前本地时间 |
+
+### 联网搜索（`web_search`）
+
+`web_search` 使用 [Tavily](https://app.tavily.com) Search API（返回标题、链接与摘要）。
+
+1. 申请 Key：https://app.tavily.com
+2. 任选一种方式配置（环境变量优先于配置文件）：
+
+```bat
+set TAVILY_API_KEY=tvly-xxxxxxxx
+```
+
+或在 `config.json` 里填写 `tavily_api_key`。未配置时 `web_search` 会报错，可改用 `fetch_url`。
 
 ## 配置
 
-可在脚本里按需调整：
+**优先改 `config.json`**（见上方「统一配置文件」）。其余：
 
 **`start.bat`**
 
 | 变量 | 默认 | 含义 |
 |------|------|------|
-| `HOST` / `PORT` | `127.0.0.1` / `8080` | 服务监听地址 |
+| `HOST` / `PORT` | `127.0.0.1` / `8080` | 本地 llama-server 监听地址（建议与 `config.json` 的 host/port 一致） |
 | `NGL` | `99` | GPU 卸载层数（无 GPU 可改为 `0`） |
 | `CTX` | `40000` | 上下文长度 |
 
-**`agent/config.py` / `agent/prompts.py`**
+**`agent/config.py` / `agent/prompts.py`（代码内常量）**
 
 | 常量 | 含义 |
 |------|------|
-| `HOST` / `PORT` | 客户端连接地址（`config.py`） |
 | `MAX_TOOL_ROUNDS` | 单轮任务最多工具调用次数 |
 | `CONFIRM_TOOLS` | 需要用户确认的工具集合 |
 | `SYSTEM_PROMPT` | 系统提示词（`prompts.py`） |
-
-**`cloud_config.json`（可选，见上方「云端模型」）**
-
-| 字段 | 含义 |
-|------|------|
-| `base_url` | 云端 / 第三方 OpenAI 兼容接口地址（不带 `/v1`） |
-| `model` | 请求体 `model` 字段 |
-| `api_key` | 鉴权用，作为 `Authorization: Bearer` 发出 |
-
-由环境变量 `CODER_AGENT_PROVIDER=cloud` 触发读取（`start.bat` 选云端选项时会自动设置）；不设置或设为其它值则走本地 `llama-server`。
 
 ## 工作原理（简要）
 

@@ -27,16 +27,6 @@ from agent.config import (
 from agent.terminal import C, paint, write_stream
 from agent.tools_schema import TOOLS
 
-# ========================================================================
-#  第 8 区：与本地模型服务通信
-
-# ========================================================================
-# llama-server 提供 OpenAI 风格接口：
-#   GET  /health              — 是否就绪
-#   GET  /v1/models           — 当前加载的模型
-#   POST /v1/chat/completions — 聊天（本程序用 stream=True 流式接收）
-#
-
 def _auth_headers(base: dict[str, str]) -> dict[str, str]:
     """云端模式下附带 Authorization: Bearer <api_key>；本地模式不加。"""
     if API_KEY:
@@ -79,14 +69,6 @@ def wait_ready(retries: int = 120) -> bool:
             sys.stdout.flush()
             time.sleep(0.45)
     return False
-
-# ========================================================================
-#  第 9 区：Agent 循环（核心逻辑）
-
-# ========================================================================
-# chat_once  = 问模型一次（可能得到文字，也可能得到 tool_calls）
-# run_agent_turn = 若有工具就执行，把结果塞回 messages，再问，直到最终回答
-#
 
 def _detect_reasoning_loop(
     text: str,

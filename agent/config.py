@@ -1,8 +1,8 @@
-"""配置常量：本地模型地址、斜杠命令、安全上限、写操作确认开关。
+"""配置常量：本地/云端模型、搜索 Key、斜杠命令、安全上限、写操作确认开关。
 
-改 HOST/PORT 时，要保证和 start.bat 里启动 llama-server 的参数一致。
-会话开关 AUTO_APPROVE / AUTO_APPROVE_ALWAYS 放在本模块，其它文件用
-`import agent.config as config` 再读写 `config.AUTO_APPROVE`。
+运行时配置统一放在项目根目录的 config.json（已 gitignore）。
+模板见 config.example.json。会话开关 AUTO_APPROVE / AUTO_APPROVE_ALWAYS
+放在本模块，其它文件用 `import agent.config as config` 再读写。
 """
 
 from __future__ import annotations
@@ -12,72 +12,108 @@ import os
 import re
 from pathlib import Path
 
+# ========================================================================
+#  默认值（可被 config.json / 环境变量覆盖）
+# ========================================================================
 HOST = "127.0.0.1"
 PORT = 8080
 BASE = f"http://{HOST}:{PORT}"
 
-# ========================================================================
-#  云端模型支持
-#
-#  默认走本地 llama-server（上面的 BASE）。想用云端 / 第三方 OpenAI 兼容接口
-#  （如 Ollama 云端模型、OpenAI、任意 OpenAI-compatible 网关）时：
-#    1. 复制 cloud_config.example.json 为 cloud_config.json，填好 base_url /
-#       api_key / model（该文件已在 .gitignore 里，不会被提交）。
-#    2. 用 start.bat 菜单选“云端模型”，或手动设环境变量
-#       CODER_AGENT_PROVIDER=cloud 后再跑 python chat.py。
-#
-#  PROVIDER    — "local"（默认，连本机 llama-server）或 "cloud"
-#  MODEL_NAME  — 云端接口通常需要在请求体里带 "model" 字段；本地 llama-server
-#                只服务一个已加载模型，不需要这个字段，留空则不发送
-#  API_KEY     — 云端鉴权用，本地留空
-#  CLOUD_CONFIG_ERROR — 云端模式但配置文件缺失/不完整时的错误说明，
-#                        main.py 启动时会检查并给出提示后退出
-# ========================================================================
+# PROVIDER    — "local"（本机 llama-server）或 "cloud"（OpenAI 兼容接口）
+# MODEL_NAME  — 云端请求体里的 model；本地可留空
+# API_KEY     — 云端鉴权；本地可留空
+# CONFIG_ERROR — 配置缺失/不完整时的错误说明，main.py 启动时检查并退出
 PROVIDER = "local"
 MODEL_NAME = ""
 API_KEY = ""
-CLOUD_CONFIG_ERROR: str | None = None
+TAVILY_API_KEY = ""
+CONFIG_ERROR: str | None = None
 
-CLOUD_CONFIG_PATH = Path(__file__).resolve().parent.parent / "cloud_config.json"
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+# 旧文件名：若只有 cloud_config.json，加载时提示迁移
+_LEGACY_CONFIG_PATH = Path(__file__).resolve().parent.parent / "cloud_config.json"
 
-def _load_cloud_config() -> None:
-    """若环境变量 CODER_AGENT_PROVIDER=cloud，读取 cloud_config.json 并覆盖
-    BASE / API_KEY / MODEL_NAME / PROVIDER。读取失败时不抛异常，改记录到
-    CLOUD_CONFIG_ERROR，交给 main.py 统一打印提示并退出（避免这里 import 阶段
-    直接崩掉，报错信息不友好）。
+
+def _load_config() -> None:
+    """读取 config.json，并用环境变量覆盖（CODER_AGENT_PROVIDER / 搜索 Key）。
+
+    优先级：
+      provider — 环境变量 CODER_AGENT_PROVIDER > config.json provider > local
+      搜索 Key — 环境变量 TAVILY_API_KEY > config.json tavily_api_key
     """
-    global BASE, PROVIDER, MODEL_NAME, API_KEY, CLOUD_CONFIG_ERROR
+    global HOST, PORT, BASE, PROVIDER, MODEL_NAME, API_KEY
+    global TAVILY_API_KEY, CONFIG_ERROR
 
-    if os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower() != "cloud":
-        return
-
-    if not CLOUD_CONFIG_PATH.exists():
-        CLOUD_CONFIG_ERROR = (
-            f"未找到云端配置文件：{CLOUD_CONFIG_PATH}\n"
-            "  请复制 cloud_config.example.json 为 cloud_config.json 并填好 base_url / model / api_key"
+    data: dict = {}
+    path = CONFIG_PATH
+    if not path.exists() and _LEGACY_CONFIG_PATH.exists():
+        CONFIG_ERROR = (
+            f"检测到旧配置文件：{_LEGACY_CONFIG_PATH.name}\n"
+            f"  请重命名为 {CONFIG_PATH.name}（或复制 config.example.json）后再启动"
         )
         return
 
-    try:
-        data = json.loads(CLOUD_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception as e:
-        CLOUD_CONFIG_ERROR = f"cloud_config.json 解析失败：{type(e).__name__}: {e}"
-        return
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            CONFIG_ERROR = f"config.json 解析失败：{type(e).__name__}: {e}"
+            return
+        if not isinstance(raw, dict):
+            CONFIG_ERROR = "config.json 必须是 JSON 对象"
+            return
+        data = raw
 
+    # —— 本地服务地址 ——
+    if data.get("host") not in (None, ""):
+        HOST = str(data["host"]).strip()
+    if data.get("port") not in (None, ""):
+        try:
+            PORT = int(data["port"])
+        except (TypeError, ValueError):
+            CONFIG_ERROR = "config.json 的 port 必须是整数"
+            return
+
+    # —— 云端模型字段 ——
     base_url = str(data.get("base_url", "")).strip().rstrip("/")
-    model = str(data.get("model", "")).strip()
-    api_key = str(data.get("api_key", "")).strip()
+    MODEL_NAME = str(data.get("model", "")).strip()
+    API_KEY = str(data.get("api_key", "")).strip()
 
-    if not base_url or not model:
-        CLOUD_CONFIG_ERROR = "cloud_config.json 需要同时填写 base_url 与 model"
+    # —— 搜索 Key（环境变量优先）——
+    TAVILY_API_KEY = (
+        os.environ.get("TAVILY_API_KEY", "").strip()
+        or str(data.get("tavily_api_key", "")).strip()
+    )
+
+    # —— provider：环境变量（start.bat 菜单）> config.json > local ——
+    env_provider = os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower()
+    file_provider = str(data.get("provider", "")).strip().lower()
+    if env_provider in {"local", "cloud"}:
+        PROVIDER = env_provider
+    elif file_provider in {"local", "cloud"}:
+        PROVIDER = file_provider
+    elif file_provider:
+        CONFIG_ERROR = 'config.json 的 provider 只能是 "local" 或 "cloud"'
         return
+    else:
+        PROVIDER = "local"
 
-    BASE = base_url
-    MODEL_NAME = model
-    API_KEY = api_key
-    PROVIDER = "cloud"
+    if PROVIDER == "cloud":
+        if not path.exists():
+            CONFIG_ERROR = (
+                f"未找到配置文件：{CONFIG_PATH}\n"
+                "  请复制 config.example.json 为 config.json 并填好 base_url / model / api_key"
+            )
+            return
+        if not base_url or not MODEL_NAME:
+            CONFIG_ERROR = "config.json 在 cloud 模式下需要同时填写 base_url 与 model"
+            return
+        BASE = base_url
+    else:
+        BASE = f"http://{HOST}:{PORT}"
 
-_load_cloud_config()
+
+_load_config()
 
 # 用户可输入的斜杠命令（不区分大小写，在 main 里处理）
 EXIT_CMDS = {"/exit", "/quit", "/q", "exit", "quit"}

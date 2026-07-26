@@ -57,13 +57,13 @@ def main() -> int:
     """
     # 1) Windows 下打开彩色终端
     enable_ansi()
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stdin.reconfigure(encoding="utf-8")
+    for stream in (sys.stdout, sys.stdin):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
 
-    # 1.5) 云端模式但配置文件缺失/不完整：提前给出友好提示再退出
-    if config.CLOUD_CONFIG_ERROR:
-        print(paint(f"✗  {config.CLOUD_CONFIG_ERROR}", C.ERR))
+    # 1.5) 配置文件缺失/不完整：提前给出友好提示再退出
+    if config.CONFIG_ERROR:
+        print(paint(f"✗  {config.CONFIG_ERROR}", C.ERR))
         return 1
 
     # 2) 等模型服务就绪（本地：start.bat 已在后台启动 llama-server；云端：直接跳过）
@@ -84,6 +84,12 @@ def main() -> int:
     # 4) 对话历史：第一条永远是 system 提示词
     messages: list[dict] = [{"role": "system", "content": build_system_prompt()}]
 
+    def switch_and_report(target_dir: Path) -> None:
+        """切工作目录 + 刷新 system 提示里的 cwd + 终端反馈。"""
+        switch_cwd(target_dir)
+        messages[0]["content"] = build_system_prompt()
+        print(paint(f"\n  ✓ 已切换工作目录：{target_dir}\n", C.TEAL))
+
     # 5) 主循环：读用户输入 → 处理斜杠命令 → 交给 Agent
     while True:
         try:
@@ -101,9 +107,7 @@ def main() -> int:
         if _looks_like_path_input(path_candidate):
             target_dir = _resolve_target_dir(path_candidate)
             if target_dir is not None:
-                switch_cwd(target_dir)
-                messages[0]["content"] = build_system_prompt()
-                print(paint(f"\n  ✓ 已切换工作目录：{target_dir}\n", C.TEAL))
+                switch_and_report(target_dir)
                 continue
 
         cmd = user_input.lower()
@@ -136,9 +140,7 @@ def main() -> int:
             if target_dir is None:
                 print(paint(f"\n  ✗ 目录不存在：{resolve_path(arg)}\n", C.ERR))
                 continue
-            switch_cwd(target_dir)
-            messages[0]["content"] = build_system_prompt()
-            print(paint(f"\n  ✓ 已切换工作目录：{target_dir}\n", C.TEAL))
+            switch_and_report(target_dir)
             continue
 
         print()
@@ -151,6 +153,10 @@ def main() -> int:
                 user_input
                 + f"\n\n[系统路径提示] 请原样使用这些绝对路径调用工具，不要改成相对路径：{abs_paths_joined}"
             )
+        # 记住本轮起点：中途异常时把这条用户消息连同未完成的
+        # assistant/tool 片段一起丢弃，避免留下残缺的 tool_calls 历史
+        # 导致后续每次请求都被服务端拒绝。
+        turn_start = len(messages)
         messages.append({"role": "user", "content": user_message_content})
 
         try:
@@ -159,11 +165,11 @@ def main() -> int:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             print(paint(f"✗  HTTP {e.code}: {detail}", C.ERR))
-            messages.pop()
+            del messages[turn_start:]
             continue
         except Exception as e:
             print(paint(f"✗  {e}", C.ERR))
-            messages.pop()
+            del messages[turn_start:]
             continue
 
     return 0

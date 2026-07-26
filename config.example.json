@@ -1,0 +1,9 @@
+{
+  "provider": "cloud",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "base_url": "https://ollama.com",
+  "model": "gpt-oss:120b-cloud",
+  "api_key": "",
+  "tavily_api_key": ""
+}

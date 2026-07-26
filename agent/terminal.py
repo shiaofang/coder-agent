@@ -401,18 +401,8 @@ def _slash_matches(prefix: str) -> list[tuple[str, str]]:
 
 
 def _visible_cols(text: str) -> int:
-    """粗算终端显示宽度（用于把光标移回输入末尾）。"""
-    plain = re.sub(r"\033\[[0-9;]*m", "", text)
-    w = 0
-    for ch in plain:
-        o = ord(ch)
-        if o <= 0x7F:
-            w += 1
-        elif 0x2E80 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F:
-            w += 2
-        else:
-            w += 1
-    return w
+    """粗算含 ANSI 颜色码文本的终端显示宽度（用于把光标移回输入末尾）。"""
+    return _status_text_width(re.sub(r"\033\[[0-9;]*m", "", text))
 
 def read_input() -> str:
     """

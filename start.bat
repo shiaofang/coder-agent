@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 set "BIN_DIR=%~dp0bin"
 set "MODEL_DIR=%~dp0models"
-set "CLOUD_CFG=%~dp0cloud_config.json"
+set "CFG=%~dp0config.json"
 set "HOST=127.0.0.1"
 set "PORT=8080"
 set "NGL=99"
@@ -37,17 +37,17 @@ if exist "%MODEL_DIR%" (
 
 set /a CLOUD_INDEX=COUNT+1
 set "HAS_CLOUD=0"
-if exist "%CLOUD_CFG%" (
+if exist "%CFG%" (
     set "HAS_CLOUD=1"
-    echo   !CLOUD_INDEX!. Cloud model  [cloud_config.json]
+    echo   !CLOUD_INDEX!. Cloud model  [config.json]
 )
 
 if %COUNT%==0 (
     if "!HAS_CLOUD!"=="0" (
-        echo [ERROR] no .gguf files in models\, and no cloud_config.json found
+        echo [ERROR] no .gguf files in models\, and no config.json found
         echo.
         echo   Local:  put a GGUF file into models\
-        echo   Cloud:  copy cloud_config.example.json to cloud_config.json and fill it in
+        echo   Cloud:  copy config.example.json to config.json and fill it in
         pause
         exit /b 1
     )
@@ -135,7 +135,7 @@ goto done
 
 :use_cloud
 echo.
-echo Selected: Cloud model  [cloud_config.json]
+echo Selected: Cloud model  [config.json]
 echo.
 
 set "CODER_AGENT_PROVIDER=cloud"

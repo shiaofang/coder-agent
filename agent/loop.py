@@ -146,7 +146,7 @@ def run_agent_turn(messages: list[dict]) -> None:
 
                         # Track repeated command failures → force web search hint
                         if name == "run_command" and (
-                            "exit=1" in result
+                            re.search(r"(?m)^exit=[1-9]", result)
                             or result.startswith("FAIL")
                             or result.startswith("ERROR")
                         ):
@@ -219,10 +219,10 @@ def run_agent_turn(messages: list[dict]) -> None:
                 print()
                 continue
 
-            # final answer
+            # final answer（走到这里说明没有 tool_calls）
             if content:
                 messages.append({"role": "assistant", "content": content})
-            elif not content and not tool_calls:
+            else:
                 print(paint("(empty response)", C.DIM, C.STATUS))
             print()
             return

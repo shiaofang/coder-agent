@@ -1,7 +1,8 @@
 """工具声明 TOOLS：给模型看的说明书（OpenAI function calling JSON Schema）。
 
 这里只是「声明」。真正执行在 agent.tools 的 tool_xxx / execute_tool。
-新增工具时要改三处：TOOLS + tool_xxx 实现 + execute_tool 分支。
+新增工具时要改两处：TOOLS 声明 + agent.tools 里的 tool_xxx 实现
+（execute_tool 会按 tool_ 前缀自动注册，无需手动加分支）。
 """
 
 from __future__ import annotations
@@ -362,8 +363,9 @@ TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "联网搜索（查报错、API、官方文档）。"
+                "联网搜索（Tavily；查报错、API、官方文档）。"
                 "同一 build/lint 错误修两次仍失败时必须调用，查询应包含完整报错关键词。"
+                "结果含标题、链接与摘要；需要正文时再 fetch_url。"
             ),
             "parameters": {
                 "type": "object",

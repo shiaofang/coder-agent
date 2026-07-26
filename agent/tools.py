@@ -7,18 +7,19 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
 import time
-import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
-from agent.config import MAX_READ_CHARS
+from agent.config import MAX_READ_CHARS, TAVILY_API_KEY
 from agent.paths import resolve_path
 from agent.terminal import C, paint
 
@@ -248,8 +249,6 @@ def tool_delete_files(paths: list[str]) -> str:
 
 def tool_move_file(src: str, dest: str) -> str:
     """工具实现：移动或重命名文件/目录。"""
-    import shutil
-
     s = resolve_path(src)
     d = resolve_path(dest)
     if not s.exists():
@@ -278,7 +277,8 @@ def tool_list_dir(path: str | None = None) -> str:
         kind = "dir " if child.is_dir() else "file"
         lines.append(f"{kind}  {child.name}")
     return f"{p}\n" + ("\n".join(lines) if lines else "(empty)")
-# ---------- 6.2 搜索文件内容 / 按名字找文件 ----------
+
+# ---------- 搜索文件内容 / 按名字找文件 ----------
 
 def tool_glob_search(pattern: str, root: str | None = None) -> str:
     """工具实现：按 glob 模式找文件，例如 **/*.py。"""
@@ -350,7 +350,8 @@ def tool_grep_search(pattern: str, path: str, glob: str | None = None) -> str:
             continue
     return "\n".join(hits) if hits else "No matches"
 
-# ---------- 6.3 执行 Shell 命令 ----------
+# ---------- 执行 Shell 命令 ----------
+
 def prepare_command(command: str) -> str:
     """Make common interactive CLIs run non-interactively."""
     cmd = command.strip()
@@ -415,7 +416,7 @@ def is_long_running_command(command: str) -> bool:
     """判断是否是会一直运行的开发服务器命令（需后台启动）。"""
     return any(re.search(p, command, re.I) for p in LONG_RUNNING_PATTERNS)
 
-def tool_run_command_background(cmd: str, work: Path, env: dict) -> str:
+def _run_command_background(cmd: str, work: Path, env: dict) -> str:
     """Start a long-running process, capture startup logs briefly, return."""
     print(paint("  ⎿  ", C.DIM) + paint("后台启动中…", C.DIM, C.SPINNER_LABEL), flush=True)
     creationflags = 0
@@ -589,7 +590,7 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
         cmd = cd_match.group("rest").strip()
 
     if is_long_running_command(cmd):
-        return tool_run_command_background(cmd, work, env)
+        return _run_command_background(cmd, work, env)
 
     print(paint("  ⎿  ", C.DIM) + paint("running…", C.DIM, C.SPINNER_LABEL), flush=True)
     try:
@@ -667,29 +668,58 @@ def tool_check_syntax(path: str) -> str:
         "其它语言请用 run_command 跑项目自带的 build/lint/typecheck 命令"
     )
 
-# ---------- 6.4 联网搜索与抓网页 ----------
+# ---------- 联网搜索与抓网页 ----------
 
-def _http_get(url: str, timeout: float = 20.0) -> str:
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+def _decode_http_body(raw: bytes, content_type: str = "") -> str:
+    charset = "utf-8"
+    m = re.search(r"charset=([\w-]+)", content_type or "", re.I)
+    if m:
+        charset = m.group(1)
+    return raw.decode(charset, errors="replace")
+
+def _http_get(
+    url: str,
+    timeout: float = 20.0,
+    headers: dict[str, str] | None = None,
+) -> str:
     """内部辅助：发 HTTP GET，返回解码后的文本。"""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        },
-        method="GET",
-    )
+    req_headers = {
+        "User-Agent": _DEFAULT_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        charset = "utf-8"
-        ctype = resp.headers.get("Content-Type", "")
-        m = re.search(r"charset=([\w-]+)", ctype, re.I)
-        if m:
-            charset = m.group(1)
-        return raw.decode(charset, errors="replace")
+        return _decode_http_body(resp.read(), resp.headers.get("Content-Type", ""))
+
+def _http_post_json(
+    url: str,
+    payload: dict,
+    timeout: float = 25.0,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    """内部辅助：POST JSON，返回解析后的 dict。"""
+    body = json.dumps(payload).encode("utf-8")
+    req_headers = {
+        "User-Agent": _DEFAULT_UA,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = _decode_http_body(resp.read(), resp.headers.get("Content-Type", ""))
+    data = json.loads(text) if text.strip() else {}
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object, got {type(data).__name__}")
+    return data
 
 def _strip_html(html: str) -> str:
     """内部辅助：去掉 HTML 标签，留下大致正文。"""
@@ -705,77 +735,77 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
+def _clip_snippet(text: str, limit: int = 400) -> str:
+    s = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1].rstrip() + "…"
+
+def _search_tavily(query: str, max_results: int = 5) -> tuple[list[dict], str | None]:
+    """调用 Tavily Search API。成功返回 (results, None)；失败返回 ([], error)。"""
+    if not TAVILY_API_KEY:
+        return [], "tavily: API key not configured"
+    try:
+        data = _http_post_json(
+            "https://api.tavily.com/search",
+            {
+                "query": query,
+                "max_results": max_results,
+                "search_depth": "basic",
+                "include_answer": False,
+            },
+            timeout=25.0,
+            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+        )
+    except Exception as e:
+        return [], f"tavily: {type(e).__name__}: {e}"
+
+    out: list[dict] = []
+    for item in data.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip() or url
+        snippet = _clip_snippet(str(item.get("content") or ""))
+        if url.startswith("http"):
+            out.append({"title": title, "url": url, "snippet": snippet, "source": "tavily"})
+        if len(out) >= max_results:
+            break
+    if not out:
+        return [], "tavily: no hits"
+    return out, None
+
 def tool_web_search(query: str) -> str:
-    """工具实现：联网搜索（DuckDuckGo / Bing / 百度兜底）。"""
+    """工具实现：联网搜索（Tavily）。"""
     q = (query or "").strip()
     if not q:
         return "ERROR: empty query"
+    if not TAVILY_API_KEY:
+        return (
+            "ERROR: no search API key configured\n"
+            "Set TAVILY_API_KEY env var, or add tavily_api_key to config.json.\n"
+            "If you know a docs URL, try fetch_url directly."
+        )
+
     print(paint("  ⎿  ", C.DIM) + paint("searching…", C.DIM, C.SPINNER_LABEL), flush=True)
 
-    results: list[tuple[str, str, str]] = []  # title, url, source
-    errors: list[str] = []
+    results, err = _search_tavily(q)
 
-    # 实测本机网络下各后端延迟差异很大：ddg ~10s 且结果可用；bing ~30s；
-    # baidu 常返回反爬验证页（几百字节，提不出结果）。因此把 ddg 放第一位，
-    # 并给每个后端按实际延迟设置足够的超时，而不是统一 12s（太短，几乎必超时）。
-    backends = [
-        (
-            "ddg",
-            "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q),
-            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            18,
-        ),
-        (
-            "bing",
-            "https://cn.bing.com/search?q=" + urllib.parse.quote(q),
-            r'<li class="b_algo".*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-            35,
-        ),
-        (
-            "baidu",
-            "https://www.baidu.com/s?wd=" + urllib.parse.quote(q),
-            r'<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-            18,
-        ),
-    ]
-
-    for source, url, pattern, backend_timeout in backends:
-        try:
-            html = _http_get(url, timeout=backend_timeout)
-        except Exception as e:
-            errors.append(f"{source}: {type(e).__name__}")
-            continue
-        for m in re.finditer(pattern, html, re.I | re.S):
-            href = m.group(1)
-            title = _strip_html(m.group(2))
-            if source == "ddg":
-                um = re.search(r"uddg=([^&]+)", href)
-                if um:
-                    href = urllib.parse.unquote(um.group(1))
-            if not title:
-                continue
-            if href.startswith("//"):
-                href = "https:" + href
-            if href.startswith("http"):
-                results.append((title, href, source))
-            if len(results) >= 5:
-                break
-        if results:
-            break
-
-    lines = [f"query={q}", ""]
+    lines = [f"query={q}", "backend=tavily", ""]
     if results:
         lines.append("== web results ==")
-        for i, (title, href, source) in enumerate(results, 1):
-            lines.append(f"{i}. [{source}] {title}")
-            lines.append(f"   {href}")
+        for i, item in enumerate(results, 1):
+            lines.append(f"{i}. [{item['source']}] {item['title']}")
+            lines.append(f"   {item['url']}")
+            if item.get("snippet"):
+                lines.append(f"   {item['snippet']}")
         lines.append("")
         lines.append("Next: fetch_url a relevant link, then apply a DIFFERENT fix.")
     else:
         lines.append("== web results ==")
-        lines.append("ERROR: all search backends failed or returned no hits")
-        if errors:
-            lines.append("backends: " + "; ".join(errors))
+        lines.append("ERROR: tavily search failed or returned no hits")
+        if err:
+            lines.append(f"detail: {err}")
         lines.append("If you know a docs URL, try fetch_url directly.")
     return "\n".join(lines)
 
@@ -795,83 +825,39 @@ def tool_fetch_url(url: str) -> str:
     return f"url={u}\n\n{text or '(empty page)'}"
 
 # ========================================================================
-#  第 7 区：工具调度
-
+#  工具调度：把模型返回的 name + arguments 映射到上面的 tool_xxx
 # ========================================================================
-# 把模型返回的 name + arguments 映射到上面的 tool_xxx。
-#
+
+# 自动收集本模块所有 tool_xxx 函数：注册名 = 去掉 tool_ 前缀后的函数名，
+# 与 tools_schema.TOOLS 里的工具名一一对应。新增工具只需写 tool_<name> + 补 schema。
+_TOOL_FUNCS: dict[str, Callable[..., str]] = {
+    fn_name[len("tool_"):]: fn
+    for fn_name, fn in sorted(globals().items())
+    if fn_name.startswith("tool_") and callable(fn)
+}
 
 def execute_tool(name: str, args: dict) -> str:
     """
     工具总调度：根据模型给出的工具名 name，把参数 args 交给对应的 tool_xxx 函数。
 
     模型不会直接跑 Python；它只返回「想调用哪个工具、参数是什么」。
-    真正执行发生在这里。
+    真正执行发生在这里。参数按函数签名过滤：模型多给的字段忽略，
+    少给必填字段则返回可读的错误让模型自行纠正。
     """
-    try:
-        if name == "read_file":
-            return tool_read_file(
-                args["path"],
-                args.get("start_line"),
-                args.get("end_line"),
-            )
-        if name == "write_file":
-            return tool_write_file(args["path"], args.get("content", ""))
-        if name == "write_files":
-            return tool_write_files(args["files"])
-        if name == "edit_file":
-            return tool_edit_file(
-                args["path"],
-                args["old_text"],
-                args["new_text"],
-                bool(args.get("replace_all", False)),
-            )
-        if name == "multi_edit":
-            return tool_multi_edit(args["edits"])
-        if name == "replace_lines":
-            return tool_replace_lines(
-                args["path"],
-                args["start_line"],
-                args["end_line"],
-                args.get("new_content", ""),
-            )
-        if name == "insert_lines":
-            return tool_insert_lines(args["path"], args["after_line"], args.get("content", ""))
-        if name == "delete_lines":
-            return tool_delete_lines(args["path"], args["start_line"], args["end_line"])
-        if name == "delete_file":
-            return tool_delete_file(args["path"])
-        if name == "delete_files":
-            return tool_delete_files(args["paths"])
-        if name == "move_file":
-            return tool_move_file(args["src"], args["dest"])
-        if name == "mkdir":
-            return tool_mkdir(args["path"])
-        if name == "list_dir":
-            return tool_list_dir(args.get("path"))
-        if name == "glob_search":
-            return tool_glob_search(args["pattern"], args.get("root"))
-        if name == "grep_search":
-            return tool_grep_search(args["pattern"], args["path"], args.get("glob"))
-        if name == "run_command":
-            return tool_run_command(args["command"], args.get("cwd"))
-        if name == "list_processes":
-            return tool_list_processes()
-        if name == "read_process_output":
-            return tool_read_process_output(args["pid"], args.get("tail_lines"))
-        if name == "kill_process":
-            return tool_kill_process(args["pid"])
-        if name == "check_syntax":
-            return tool_check_syntax(args["path"])
-        if name == "web_search":
-            return tool_web_search(args["query"])
-        if name == "fetch_url":
-            return tool_fetch_url(args["url"])
-        if name == "get_datetime":
-            return tool_get_datetime()
+    fn = _TOOL_FUNCS.get(name)
+    if fn is None:
         return f"ERROR: unknown tool {name}"
-    except KeyError as e:
-        return f"ERROR: missing argument {e}"
+    params = inspect.signature(fn).parameters
+    kwargs = {k: v for k, v in args.items() if k in params}
+    missing = [
+        p.name
+        for p in params.values()
+        if p.default is inspect.Parameter.empty and p.name not in kwargs
+    ]
+    if missing:
+        return f"ERROR: missing argument(s): {', '.join(missing)}"
+    try:
+        return fn(**kwargs)
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
