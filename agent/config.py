@@ -1,7 +1,7 @@
-"""配置常量：本地/云端模型、搜索 Key、斜杠命令、安全上限、写操作确认开关。
+"""配置常量：本地/云端模型、llama-server 参数、采样参数、搜索 Key、斜杠命令、安全上限、会话开关。
 
 运行时配置统一放在项目根目录的 config.json（已 gitignore）。
-模板见 config.example.json。会话开关 AUTO_APPROVE / AUTO_APPROVE_ALWAYS
+模板见 config.example.json。会话开关（AUTO_APPROVE / THINKING / VERBOSE 等）
 放在本模块，其它文件用 `import agent.config as config` 再读写。
 """
 
@@ -11,6 +11,13 @@ import json
 import os
 import re
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+BIN_DIR = ROOT_DIR / "bin"
+MODEL_DIR = ROOT_DIR / "models"
+SESSION_DIR = ROOT_DIR / "sessions"
+HISTORY_FILE = ROOT_DIR / ".history"
+LAST_MODEL_FILE = ROOT_DIR / ".last_model"
 
 # ========================================================================
 #  默认值（可被 config.json / 环境变量覆盖）
@@ -24,25 +31,53 @@ BASE = f"http://{HOST}:{PORT}"
 # API_KEY     — 云端鉴权；本地可留空
 # CONFIG_ERROR — 配置缺失/不完整时的错误说明，main.py 启动时检查并退出
 PROVIDER = "local"
+PROVIDER_FROM_ENV = False  # 环境变量显式指定了 provider 时不再弹「本地/云端」菜单
+CLOUD_BASE = ""  # config.json 里的 base_url（供菜单里切到云端时使用）
 MODEL_NAME = ""
 API_KEY = ""
 TAVILY_API_KEY = ""
 CONFIG_ERROR: str | None = None
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+# llama-server 启动参数（config.json -> "server"）
+#   fit_margin  — 预留给桌面/浏览器的显存 MiB（-fitt）
+#   fit_ctx     — --fit 允许的最小上下文（-fitc）；系统提示 + 工具声明约 2k token
+#   ngl / ctx   — 手动写死 -ngl / -c（None = 交给 --fit 自适应）
+#   extra_args  — 追加的原始参数列表
+SERVER: dict = {
+    "fit_margin": 384,
+    "fit_ctx": 16384,
+    "ngl": None,
+    "ctx": None,
+    "extra_args": [],
+}
+
+# 采样参数（config.json -> "sampling"），非 None 的字段才会放进请求体
+SAMPLING: dict = {
+    "temperature": 0.3,
+    "top_p": None,
+    "top_k": None,
+    "min_p": None,
+    "repeat_penalty": None,
+}
+
+# 提示词分级："auto"（≤5B 用 compact）/ "full" / "compact"
+PROMPT_TIER = "auto"
+
+CONFIG_PATH = ROOT_DIR / "config.json"
 # 旧文件名：若只有 cloud_config.json，加载时提示迁移
-_LEGACY_CONFIG_PATH = Path(__file__).resolve().parent.parent / "cloud_config.json"
+_LEGACY_CONFIG_PATH = ROOT_DIR / "cloud_config.json"
 
 
 def _load_config() -> None:
-    """读取 config.json，并用环境变量覆盖（CODER_AGENT_PROVIDER / 搜索 Key）。
+    """读取 config.json，并用环境变量覆盖（CODER_AGENT_PROVIDER / 搜索 Key / NGL / CTX）。
 
     优先级：
       provider — 环境变量 CODER_AGENT_PROVIDER > config.json provider > local
       搜索 Key — 环境变量 TAVILY_API_KEY > config.json tavily_api_key
+      ngl/ctx  — 环境变量 CODER_AGENT_NGL / CODER_AGENT_CTX > config.json server.*
     """
-    global HOST, PORT, BASE, PROVIDER, MODEL_NAME, API_KEY
-    global TAVILY_API_KEY, CONFIG_ERROR
+    global HOST, PORT, BASE, PROVIDER, PROVIDER_FROM_ENV, CLOUD_BASE, MODEL_NAME, API_KEY
+    global TAVILY_API_KEY, CONFIG_ERROR, PROMPT_TIER
 
     data: dict = {}
     path = CONFIG_PATH
@@ -75,7 +110,7 @@ def _load_config() -> None:
             return
 
     # —— 云端模型字段 ——
-    base_url = str(data.get("base_url", "")).strip().rstrip("/")
+    CLOUD_BASE = str(data.get("base_url", "")).strip().rstrip("/")
     MODEL_NAME = str(data.get("model", "")).strip()
     API_KEY = str(data.get("api_key", "")).strip()
 
@@ -85,11 +120,48 @@ def _load_config() -> None:
         or str(data.get("tavily_api_key", "")).strip()
     )
 
-    # —— provider：环境变量（start.bat 菜单）> config.json > local ——
+    # —— llama-server 参数 ——
+    srv = data.get("server")
+    if isinstance(srv, dict):
+        for key in ("fit_margin", "fit_ctx", "ngl", "ctx"):
+            if key in srv and srv[key] not in (None, ""):
+                try:
+                    SERVER[key] = int(srv[key])
+                except (TypeError, ValueError):
+                    CONFIG_ERROR = f"config.json 的 server.{key} 必须是整数"
+                    return
+        extra = srv.get("extra_args")
+        if isinstance(extra, list):
+            SERVER["extra_args"] = [str(x) for x in extra]
+    for env_key, cfg_key in (("CODER_AGENT_NGL", "ngl"), ("CODER_AGENT_CTX", "ctx")):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            try:
+                SERVER[cfg_key] = int(val)
+            except ValueError:
+                pass
+
+    # —— 采样参数 ——
+    samp = data.get("sampling")
+    if isinstance(samp, dict):
+        for key in SAMPLING:
+            if key in samp and samp[key] not in (None, ""):
+                try:
+                    SAMPLING[key] = float(samp[key]) if key != "top_k" else int(samp[key])
+                except (TypeError, ValueError):
+                    CONFIG_ERROR = f"config.json 的 sampling.{key} 必须是数字"
+                    return
+
+    tier = str(data.get("prompt_tier", "")).strip().lower()
+    if tier in {"auto", "full", "compact"}:
+        PROMPT_TIER = tier
+
+    # —— provider：环境变量 > config.json > local ——
     env_provider = os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower()
     file_provider = str(data.get("provider", "")).strip().lower()
     if env_provider in {"local", "cloud"}:
         PROVIDER = env_provider
+        PROVIDER_FROM_ENV = True
     elif file_provider in {"local", "cloud"}:
         PROVIDER = file_provider
     elif file_provider:
@@ -105,31 +177,97 @@ def _load_config() -> None:
                 "  请复制 config.example.json 为 config.json 并填好 base_url / model / api_key"
             )
             return
-        if not base_url or not MODEL_NAME:
+        if not CLOUD_BASE or not MODEL_NAME:
             CONFIG_ERROR = "config.json 在 cloud 模式下需要同时填写 base_url 与 model"
             return
-        BASE = base_url
+        BASE = CLOUD_BASE
     else:
         BASE = f"http://{HOST}:{PORT}"
 
 
 _load_config()
 
+
+def cloud_available() -> bool:
+    """config.json 里是否配好了可用的云端模型。"""
+    return bool(CLOUD_BASE and MODEL_NAME)
+
+
+def use_cloud() -> None:
+    """运行时切到云端模型（菜单选择）。"""
+    global PROVIDER, BASE
+    PROVIDER = "cloud"
+    BASE = CLOUD_BASE
+
+
+def use_local() -> None:
+    """运行时切到本地 llama-server。"""
+    global PROVIDER, BASE
+    PROVIDER = "local"
+    BASE = f"http://{HOST}:{PORT}"
+
+
+# ========================================================================
+#  运行时状态（会话内可变）
+# ========================================================================
+# 当前模型信息（server.py 启动后填写；云端用 MODEL_NAME）
+MODEL_LABEL = ""  # 横幅/状态栏显示用
+MODEL_PARAMS_B: float | None = None  # 从文件名解析的参数量（B）
+MODEL_N_CTX = 0  # 服务端实际上下文长度；0 = 未知
+DEFAULT_CLOUD_CTX = 128_000
+
+# 会话开关
+THINKING = True  # /think on|off → chat_template_kwargs.enable_thinking
+VERBOSE = False  # /verbose → 工具结果 / 思考全量显示
+
+
+def prompt_tier() -> str:
+    """当前应使用的提示词档位（full / compact）。"""
+    if PROMPT_TIER in {"full", "compact"}:
+        return PROMPT_TIER
+    if MODEL_PARAMS_B is not None and MODEL_PARAMS_B <= 5:
+        return "compact"
+    return "full"
+
+
+def n_ctx() -> int:
+    """当前上下文长度（未知时按 provider 给默认值）。"""
+    if MODEL_N_CTX > 0:
+        return MODEL_N_CTX
+    return DEFAULT_CLOUD_CTX if PROVIDER == "cloud" else int(SERVER["fit_ctx"])
+
+
 # 用户可输入的斜杠命令（不区分大小写，在 main 里处理）
 EXIT_CMDS = {"/exit", "/quit", "/q", "exit", "quit"}
-CLEAR_CMDS = {"/clear_cache", "/reset", "/new"}
+CLEAR_CMDS = {"/clear_cache", "/reset", "/new", "/clear"}
 AUTO_CMDS = {"/auto"}
 MANUAL_CMDS = {"/manual"}
 PWD_CMDS = {"/pwd", "/dir"}
 CD_CMD = "/cd"  # 后面带参数（路径），不能放进固定集合，用前缀匹配
+MODEL_CMDS = {"/model"}
+COMPACT_CMDS = {"/compact"}
+CTX_CMDS = {"/ctx"}
+RESUME_CMD = "/resume"  # 可带序号参数
+SESSIONS_CMDS = {"/sessions"}
+VERBOSE_CMDS = {"/verbose"}
+THINK_CMD = "/think"  # /think on|off
+HELP_CMDS = {"/help", "/?"}
 
 # 输入以 / 开头时弹出的命令菜单（展示用；实际匹配仍看上面的集合）
 SLASH_MENU: list[tuple[str, str]] = [
     ("/cd", "切换工作目录，如 /cd .. 或 /cd D:\\project"),
     ("/pwd", "查看当前工作目录"),
-    ("/clear_cache", "清空对话"),
+    ("/model", "切换本地 GGUF 模型（保留对话）"),
+    ("/compact", "压缩对话历史，腾出上下文"),
+    ("/ctx", "查看上下文用量"),
+    ("/think", "/think on|off 开关模型思考"),
+    ("/verbose", "切换工具结果 / 思考全量显示"),
+    ("/resume", "恢复最近的会话，/resume 2 选第 2 条"),
+    ("/sessions", "列出已保存的会话"),
+    ("/new", "新会话（清空对话）"),
     ("/auto", "全程自动执行"),
     ("/manual", "每次确认"),
+    ("/help", "命令说明"),
     ("/exit", "退出"),
 ]
 
@@ -144,22 +282,21 @@ REASONING_LOOP_NGRAM = 24
 REASONING_LOOP_THRESHOLD = 4
 MAX_REASONING_ABORTS = 3
 
+# 上下文压缩阈值（占 n_ctx 的比例）
+COMPACT_L1_RATIO = 0.75  # 折叠旧工具结果
+COMPACT_L2_RATIO = 0.90  # 模型总结旧对话
+
 # 写操作 / 跑命令前，需要用户在终端确认（读文件等安全操作直接放行）。
 # AUTO_APPROVE        — 本轮任务内自动放行（选「自动执行」或下一轮会重置）
 # AUTO_APPROVE_ALWAYS — 全局自动（用户输入 /auto），直到 /manual
 CONFIRM_TOOLS = {
     "write_file",
-    "write_files",
     "edit_file",
-    "multi_edit",
-    "replace_lines",
-    "insert_lines",
-    "delete_lines",
-    "delete_file",
-    "delete_files",
+    "edit_lines",
+    "delete_path",
     "move_file",
     "run_command",
-    "kill_process",
+    "process",
 }
 AUTO_APPROVE = False
 AUTO_APPROVE_ALWAYS = False

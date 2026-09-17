@@ -5,8 +5,9 @@
 ================================
 
 【这个程序在干什么？】
-  start.bat 会先启动 bin/llama-server.exe（本地大模型服务），
-  再运行本文件。本文件是一个「终端聊天客户端 + 工具执行器」：
+  start.bat 检查依赖后运行本文件；本文件启动时让你选一个 GGUF，
+  由 agent/server.py 拉起 bin/llama-server.exe（本地大模型服务）。
+  然后进入一个「终端聊天客户端 + 工具执行器」：
 
   1. 你在终端里打字（例如：帮我在某某目录创建一个 Vue 项目）
   2. 本程序把对话发给本地模型（http://127.0.0.1:8080）
@@ -23,10 +24,14 @@
 【代码在哪里？】
   实现已拆到 agent/ 包，本文件只做启动入口：
 
-  agent/config.py        — 地址、命令、安全开关
+  agent/config.py        — 配置、命令、安全开关、运行时状态
+  agent/server.py        — 选模型、启动/切换 llama-server
   agent/prompts.py       — 系统提示词
   agent/tools_schema.py  — 给模型看的工具说明书（JSON Schema）
-  agent/terminal.py      — 颜色、横幅、确认菜单、输入
+  agent/render.py        — rich 渲染：markdown / diff / 工具结果
+  agent/terminal.py      — 按键读取、确认菜单、prompt_toolkit 输入
+  agent/context.py       — 上下文用量估算与压缩
+  agent/session.py       — 会话保存 / 恢复
   agent/paths.py         — Windows 路径解析
   agent/tools.py         — tool_xxx 真正干活 + execute_tool 分发
   agent/model.py         — 跟 llama-server 通信 / chat_once

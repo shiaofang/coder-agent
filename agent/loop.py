@@ -6,15 +6,21 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
-import sys
+import time
 
-from agent import config
+from agent import config, context
 from agent.config import MAX_REASONING_ABORTS, MAX_TOOL_ROUNDS
 from agent.model import chat_once
-from agent.terminal import C, ask_tool_approval, flush_input_buffer, paint, show_tool_call, show_tool_result
+from agent.render import console, error, show_tool_call, show_tool_result, show_turn_stats, warn
+from agent.terminal import ask_tool_approval, flush_input_buffer
 from agent.tools import execute_tool
+
+_EDIT_TOOLS = {"edit_file", "edit_lines"}
+_WRITE_TOOLS = _EDIT_TOOLS | {"write_file"}
+
 
 def extract_error_fingerprint(text: str) -> str:
     """从命令输出里抽出简短错误指纹，用于判断是否反复同一报错。"""
@@ -35,16 +41,17 @@ def extract_error_fingerprint(text: str) -> str:
             return line.strip()[:160]
     return ""
 
+
 def tool_call_signature(name: str, args: dict) -> str:
     """把一次工具调用压成字符串签名，用来检测「完全相同的重复操作」。"""
     if name == "edit_file":
-        return f"edit|{args.get('path')}|{args.get('old_text')}|{args.get('new_text')}"
-    if name == "multi_edit":
-        return "multiedit|" + json.dumps(args.get("edits"), ensure_ascii=False, sort_keys=True)[:400]
-    if name == "replace_lines":
+        return "edit|" + json.dumps(
+            {k: args.get(k) for k in ("path", "old_text", "new_text", "edits")}, ensure_ascii=False, sort_keys=True
+        )[:600]
+    if name == "edit_lines":
         return (
-            f"repl|{args.get('path')}|{args.get('start_line')}-"
-            f"{args.get('end_line')}|{args.get('new_content')}"
+            f"lines|{args.get('path')}|{args.get('mode')}|{args.get('start_line')}-"
+            f"{args.get('end_line')}|{args.get('content')}"
         )
     if name == "run_command":
         cmd = str(args.get("command") or "")
@@ -53,6 +60,61 @@ def tool_call_signature(name: str, args: dict) -> str:
     if name == "web_search":
         return f"search|{args.get('query')}"
     return f"{name}|{json.dumps(args, ensure_ascii=False, sort_keys=True)[:200]}"
+
+
+# ------------------------------------------------------------------------
+#  小模型常见的 JSON 参数错误修复
+# ------------------------------------------------------------------------
+
+def parse_tool_args(raw: str) -> tuple[dict, str]:
+    """尽力把模型给的 arguments 解析成 dict。返回 (args, error)；error 非空表示失败。"""
+    text = (raw or "").strip()
+    if not text:
+        return {}, ""
+    try:
+        obj = json.loads(text)
+        return (obj if isinstance(obj, dict) else {}), ""
+    except json.JSONDecodeError as first_err:
+        err = f"{first_err.msg} at pos {first_err.pos}"
+
+    candidates: list[str] = []
+    t = text
+    # 1) 去掉 ```json 围栏
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I).strip()
+    candidates.append(t)
+    # 2) 去掉尾逗号
+    t2 = re.sub(r",\s*([}\]])", r"\1", t)
+    candidates.append(t2)
+    # 3) 补齐未闭合的括号/引号
+    t3 = t2
+    if t3.count('"') % 2 == 1:
+        t3 += '"'
+    depth_obj = t3.count("{") - t3.count("}")
+    depth_arr = t3.count("[") - t3.count("]")
+    t3 += "]" * max(0, depth_arr) + "}" * max(0, depth_obj)
+    candidates.append(t3)
+    # 4) 多个 JSON 对象粘在一起（{...}{...}）：只取第一个
+    m = re.match(r"^\s*(\{.*?\})\s*\{", t, flags=re.S)
+    if m:
+        candidates.append(m.group(1))
+
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj, ""
+        except json.JSONDecodeError:
+            continue
+    # 5) Python 字面量（单引号 / True / None）
+    for cand in candidates:
+        try:
+            obj = ast.literal_eval(cand)
+            if isinstance(obj, dict):
+                return obj, ""
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            continue
+    return {}, err
+
 
 def run_agent_turn(messages: list[dict]) -> None:
     """
@@ -74,21 +136,43 @@ def run_agent_turn(messages: list[dict]) -> None:
     # 本轮开始时的消息长度：中断时丢掉未完成的 assistant/tool 片段，保留用户消息
     start_len = len(messages)
 
+    t0 = time.time()
+    tool_count = 0
+    last_stats: dict = {}
+    total_predicted = 0
+
+    def finish_stats() -> None:
+        stats = dict(last_stats)
+        if total_predicted:
+            stats["predicted_n"] = total_predicted
+        used, total = context.usage(messages)
+        show_turn_stats(time.time() - t0, stats, tool_count, used, total)
+        console.print()
+
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            content, tool_calls, reasoning, looped = chat_once(messages)
+            context.check(messages)
+            res = chat_once(messages)
+            if res.stats:
+                last_stats = res.stats
+                total_predicted += int(res.stats.get("predicted_n") or 0)
 
-            if looped:
+            def calibrate() -> None:
+                # assistant 消息 append 之后调用，让锚点覆盖到它
+                context.calibrate(
+                    res.stats.get("prompt_tokens") or res.stats.get("prompt_n"),
+                    res.stats.get("predicted_n"),
+                    messages,
+                )
+
+            if res.looped:
                 reasoning_abort_count += 1
                 if reasoning_abort_count > MAX_REASONING_ABORTS:
-                    print(
-                        paint(
-                            f"✗ 模型连续 {reasoning_abort_count} 次陷入重复思考，已停止本轮。",
-                            C.ERR,
-                        )
-                        + paint("可尝试换个说法、拆小任务，或换更大的模型。", C.DIM, C.STATUS)
+                    error(
+                        f"模型连续 {reasoning_abort_count} 次陷入重复思考，已停止本轮。"
+                        "[dim] 可尝试换个说法、拆小任务、/think off，或换更大的模型。[/]"
                     )
-                    print()
+                    finish_stats()
                     return
                 messages.append(
                     {
@@ -102,44 +186,50 @@ def run_agent_turn(messages: list[dict]) -> None:
                 )
                 continue
 
+            content, tool_calls, reasoning = res.content, res.tool_calls, res.reasoning
+
             if tool_calls:
                 assistant_msg: dict = {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
                 if reasoning:
                     assistant_msg["reasoning_content"] = reasoning
                 messages.append(assistant_msg)
+                calibrate()
 
                 for tc in tool_calls:
                     name = tc["function"]["name"]
                     raw_args = tc["function"].get("arguments") or "{}"
-                    try:
-                        args = json.loads(raw_args) if raw_args.strip() else {}
-                    except json.JSONDecodeError:
-                        args = {}
-                        result = f"ERROR: invalid JSON arguments: {raw_args}"
+                    args, parse_err = parse_tool_args(raw_args)
+                    tool_count += 1
+                    if parse_err:
+                        result = (
+                            f"ERROR: arguments 不是合法 JSON（{parse_err}）。"
+                            f"请重新调用 {name}，参数必须是一个 JSON 对象，字符串用双引号、不要尾逗号。"
+                            f"\n原始内容前 200 字：{raw_args[:200]}"
+                        )
                         show_tool_call(name, args)
-                        show_tool_result(result)
+                        show_tool_result(result, name)
                     else:
                         sig = tool_call_signature(name, args)
                         # Block identical mutating edits looping
-                        if (
-                            name in {"edit_file", "multi_edit", "replace_lines", "insert_lines", "delete_lines"}
-                            and recent_sigs.count(sig) >= 1
-                        ):
+                        if name in _EDIT_TOOLS and recent_sigs.count(sig) >= 1:
                             result = (
                                 "ERROR: 重复操作 — 完全相同的编辑已经执行过一次，禁止再原样重试。"
                                 "先用 read_file 确认文件当前内容（很可能已经生效，或者 old_text/行号已经不对了），"
                                 "再决定下一步；如果是同一个报错反复修不好，才需要 web_search 报错原文换思路。"
                             )
                             show_tool_call(name, args)
-                            show_tool_result(result)
+                            show_tool_result(result, name)
                         else:
                             show_tool_call(name, args)
-                            if not ask_tool_approval(name, args):
+                            approved, reason = ask_tool_approval(name, args)
+                            if not approved:
                                 result = "ERROR: user denied tool execution"
-                                show_tool_result(result)
+                                if reason:
+                                    result += f". 用户说明：{reason}"
+                                show_tool_result(result, name)
                             else:
                                 result = execute_tool(name, args)
-                                show_tool_result(result)
+                                show_tool_result(result, name)
                             recent_sigs.append(sig)
                             if len(recent_sigs) > 24:
                                 recent_sigs = recent_sigs[-24:]
@@ -158,43 +248,40 @@ def run_agent_turn(messages: list[dict]) -> None:
                                     searched_this_error = False
                                 same = sum(1 for x in build_error_hist if x == fp)
                                 if same >= 2 and not searched_this_error:
-                                    hint = (
-                                        f"\n\nLOOP_HINT: 同一报错已经出现 {same} 次：\n  {fp}\n"
-                                        "下一步必须：web_search（查询词=这条报错原文 + 项目实际用的框架/库名），"
-                                        "再 fetch_url 打开一个相关结果；禁止重复刚才的改法。"
-                                    )
+                                    if config.TAVILY_API_KEY:
+                                        hint = (
+                                            f"\n\nLOOP_HINT: 同一报错已经出现 {same} 次：\n  {fp}\n"
+                                            "下一步必须：web_search（查询词=这条报错原文 + 项目实际用的框架/库名），"
+                                            "再 fetch_url 打开一个相关结果；禁止重复刚才的改法。"
+                                        )
+                                    else:
+                                        hint = (
+                                            f"\n\nLOOP_HINT: 同一报错已经出现 {same} 次：\n  {fp}\n"
+                                            "禁止重复刚才的改法；重新读报错指向的文件与相关调用处，换一种思路修。"
+                                        )
                                     result = result + hint
                                     searched_this_error = True
                                 if same >= 3:
-                                    hint2 = (
+                                    result = result + (
                                         "\n\nESCALATE: 本地小修已经反复失败。"
-                                        "请基于已经搜到的资料，用项目实际框架/库的已知正确写法"
+                                        "请基于已经掌握的信息，用项目实际框架/库的已知正确写法"
                                         "重写这个文件/组件里出问题的部分，禁止再对同几行做微调。"
                                     )
-                                    result = result + hint2
 
                         if name == "web_search":
                             searched_this_error = True
 
-                        # 搜索/抓取次数堆积但一直没落地改代码 → 强制收敛，别再换个说法接着搜
+                        # 搜索/抓取次数堆积但一直没落地改代码 → 强制收敛
                         if name in {"web_search", "fetch_url"}:
                             research_call_count += 1
                             if research_call_count >= 3:
                                 result = result + (
                                     f"\n\nSTOP_SEARCHING: 已经调用了 {research_call_count} 次 "
                                     "web_search/fetch_url，还没有真正改代码。"
-                                    "禁止再搜索或换个说法重新搜索，必须直接根据已拿到的信息"
-                                    "用 edit_file/replace_lines 对文件做一次具体修改，"
+                                    "禁止再搜索，必须直接根据已拿到的信息用 edit_file/edit_lines 做一次具体修改，"
                                     "再用 run_command 重新跑检查/构建看结果。"
                                 )
-                        elif name in {
-                            "edit_file",
-                            "multi_edit",
-                            "replace_lines",
-                            "insert_lines",
-                            "delete_lines",
-                            "write_file",
-                        }:
+                        elif name in _WRITE_TOOLS:
                             research_call_count = 0
 
                         # 连续 grep_search（常见于无目的枚举）→ 提醒回到报错本身
@@ -204,7 +291,7 @@ def run_agent_turn(messages: list[dict]) -> None:
                                 result = result + (
                                     f"\n\nSTOP_GUESSING: 已经连续 {grep_streak} 次 grep_search，这是在瞎猜。"
                                     "禁止再无目的枚举关键词；必须回到报错信息里的文件名/行号/标识符，"
-                                    "用 read_file 读上下文，或 web_search 搜完整报错原文。"
+                                    "用 read_file 读上下文。"
                                 )
                         else:
                             grep_streak = 0
@@ -216,26 +303,24 @@ def run_agent_turn(messages: list[dict]) -> None:
                             "content": result,
                         }
                     )
-                print()
+                console.print()
                 continue
 
             # final answer（走到这里说明没有 tool_calls）
             if content:
                 messages.append({"role": "assistant", "content": content})
+                calibrate()
             else:
-                print(paint("(empty response)", C.DIM, C.STATUS))
-            print()
+                console.print("[dim](empty response)[/]")
+            finish_stats()
             return
 
-        print(
-            paint("✗ 工具轮次达到上限", C.ERR)
-            + paint(f"（{MAX_TOOL_ROUNDS}），请再发一条消息让模型继续", C.DIM, C.STATUS)
-        )
+        error(f"工具轮次达到上限[dim]（{MAX_TOOL_ROUNDS}），请再发一条消息让模型继续[/]")
+        finish_stats()
     except KeyboardInterrupt:
-        sys.stdout.write(C.RESET + "\n")
-        print(paint("⚠ 已取消当前任务（提示符下再按 Ctrl+C 退出）", C.ERR))
-        print()
+        console.print()
+        warn("已取消当前任务（提示符下再按 Ctrl+C 退出）")
+        console.print()
         del messages[start_len:]
         config.AUTO_APPROVE = False
         flush_input_buffer()
-

@@ -21,7 +21,7 @@ from typing import Callable
 
 from agent.config import MAX_READ_CHARS, TAVILY_API_KEY
 from agent.paths import resolve_path
-from agent.terminal import C, paint
+from agent.render import show_note
 
 # 本次会话里通过 run_command 启动的后台进程：pid -> {proc, cmd, cwd, log_path, started_at}
 # 只在内存里维护，agent 进程退出后自然清空。
@@ -61,8 +61,7 @@ def tool_read_file(
         return text[:MAX_READ_CHARS] + f"\n\n...[truncated, showing partial of {total} lines]"
     return text
 
-def tool_write_file(path: str, content: str) -> str:
-    """工具实现：创建或整文件覆盖写入。小改动应优先用 edit_file。"""
+def _write_one(path: str, content: str) -> str:
     p = resolve_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     existed = p.is_file()
@@ -70,53 +69,46 @@ def tool_write_file(path: str, content: str) -> str:
     p.write_text(content, encoding="utf-8", newline="\n")
     msg = f"OK: wrote {len(content)} chars to {p}"
     if existed and old_len > 200:
-        msg += (
-            " | HINT: file already existed — for small fixes prefer edit_file/"
-            "replace_lines next time instead of full rewrite"
-        )
+        msg += " | HINT: file already existed — for small fixes prefer edit_file next time"
     return msg
 
-def tool_write_files(files: list[dict]) -> str:
-    """工具实现：一次性创建/覆盖写入多个文件，适合"批量建 N 个文件"的场景，
-    避免逐个 write_file 来回确认。每条同 write_file 语义，单条失败不影响其它条。"""
-    if not files:
-        return "ERROR: files is empty"
-    results: list[str] = []
-    ok_count = 0
-    for i, f in enumerate(files, 1):
-        if not isinstance(f, dict):
-            results.append(f"[{i}] ERROR: file item must be an object")
-            continue
-        try:
-            path = f["path"]
-        except KeyError as exc:
-            results.append(f"[{i}] ERROR: missing field {exc}")
-            continue
-        r = tool_write_file(path, f.get("content", ""))
-        results.append(f"[{i}] {path}: {r}")
-        if r.startswith("OK"):
-            ok_count += 1
-    return f"{ok_count}/{len(files)} succeeded\n" + "\n".join(results)
-
-def tool_edit_file(
-    path: str,
-    old_text: str,
-    new_text: str,
-    replace_all: bool = False,
+def tool_write_file(
+    path: str | None = None,
+    content: str | None = None,
+    files: list[dict] | None = None,
 ) -> str:
-    """工具实现：把文件中的 old_text 精确替换成 new_text。"""
-    p = resolve_path(path)
-    if not p.is_file():
-        return f"ERROR: file not found: {p}"
-    text = p.read_text(encoding="utf-8", errors="replace")
+    """工具实现：创建或整文件覆盖写入。传 files=[{path,content},…] 可批量写多个文件。"""
+    if files:
+        if not isinstance(files, list):
+            return "ERROR: files must be an array of {path, content}"
+        results: list[str] = []
+        ok_count = 0
+        for i, f in enumerate(files, 1):
+            if not isinstance(f, dict) or not f.get("path"):
+                results.append(f"[{i}] ERROR: item must be an object with path")
+                continue
+            r = _write_one(str(f["path"]), str(f.get("content") or ""))
+            results.append(f"[{i}] {f['path']}: {r}")
+            if r.startswith("OK"):
+                ok_count += 1
+        return f"{ok_count}/{len(files)} succeeded\n" + "\n".join(results)
+    if not path:
+        return "ERROR: path is required (or pass files=[…])"
+    return _write_one(path, content if content is not None else "")
+
+# ---------- 精确编辑：纯函数（供执行与 diff 预览共用） ----------
+
+def apply_text_edit(text: str, old_text: str, new_text: str, replace_all: bool = False) -> tuple[str, str]:
+    """对文本做一次 old→new 替换。返回 (new_text, "") 或 ("", error)。"""
     if old_text == new_text:
-        return (
+        return "", (
             "ERROR: no-op edit — old_text and new_text are identical. "
-            "Change real code, or web_search the error and try a different fix."
+            "Change real code, or try a different fix."
         )
+    if old_text == "":
+        return "", "ERROR: old_text is empty"
     count = text.count(old_text)
     if count == 0:
-        # Help model with nearby lines containing a distinctive snippet
         tip = ""
         key = old_text.strip().splitlines()[0][:40] if old_text.strip() else ""
         if key:
@@ -124,127 +116,219 @@ def tool_edit_file(
                 if key in line:
                     tip = f" | nearest line {i}: {line.strip()[:120]}"
                     break
-        return f"ERROR: old_text not found in file{tip}"
-    if replace_all:
-        new = text.replace(old_text, new_text)
-        n = count
-    else:
-        new = text.replace(old_text, new_text, 1)
-        n = 1
+        return "", f"ERROR: old_text not found in file{tip}"
+    new = text.replace(old_text, new_text) if replace_all else text.replace(old_text, new_text, 1)
     if new == text:
-        return "ERROR: no-op edit — file content unchanged after replace"
-    p.write_text(new, encoding="utf-8", newline="\n")
-    return f"OK: replaced {n} occurrence(s) in {p}"
+        return "", "ERROR: no-op edit — file content unchanged after replace"
+    return new, ""
 
-def tool_multi_edit(edits: list[dict]) -> str:
-    """工具实现：一次性对多个文件/多处内容做精确替换（每条同 edit_file 语义），
-    减少跨文件重构时来回调用的次数。逐条执行，某条失败不影响其它条。"""
-    if not edits:
-        return "ERROR: edits is empty"
-    results: list[str] = []
-    ok_count = 0
-    for i, e in enumerate(edits, 1):
-        if not isinstance(e, dict):
-            results.append(f"[{i}] ERROR: edit item must be an object")
-            continue
-        try:
-            path = e["path"]
-            old_text = e["old_text"]
-            new_text = e["new_text"]
-        except KeyError as exc:
-            results.append(f"[{i}] ERROR: missing field {exc}")
-            continue
-        r = tool_edit_file(path, old_text, new_text, bool(e.get("replace_all", False)))
-        results.append(f"[{i}] {path}: {r}")
-        if r.startswith("OK"):
-            ok_count += 1
-    summary = f"{ok_count}/{len(edits)} succeeded"
-    return summary + "\n" + "\n".join(results)
 
-def tool_replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
-    """工具实现：按行号区间替换一段内容。"""
-    p = resolve_path(path)
-    if not p.is_file():
-        return f"ERROR: file not found: {p}"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+def apply_line_edit(
+    text: str, mode: str, start_line: int, end_line: int | None, content: str | None
+) -> tuple[str, str, str]:
+    """按行号编辑。返回 (new_text, summary, error)。
+
+    mode=replace：替换 start..end（含）；insert：插到 start_line 之后（0=文件开头）；
+    delete：删除 start..end。
+    """
+    lines = text.splitlines(keepends=True)
     n = len(lines)
     try:
         start = int(start_line)
-        end = int(end_line)
+        end = int(end_line) if end_line is not None else start
     except (TypeError, ValueError):
-        return "ERROR: start_line/end_line must be integers"
+        return "", "", "ERROR: start_line/end_line must be integers"
+    mode = (mode or "").strip().lower()
+
+    if mode == "insert":
+        if start < 0 or start > n:
+            return "", "", f"ERROR: start_line {start} out of range (0..{n}) for insert"
+        if not content:
+            return "", "", "ERROR: content is empty"
+        insert = content.splitlines(keepends=True)
+        if insert and not insert[-1].endswith("\n"):
+            insert[-1] += "\n"
+        new_lines = lines[:start] + insert + lines[start:]
+        return "".join(new_lines), f"inserted {len(insert)} line(s) after line {start}", ""
+
+    if mode not in {"replace", "delete"}:
+        return "", "", f"ERROR: mode must be replace | insert | delete, got {mode!r}"
     if start < 1 or end < start or start > n:
-        return f"ERROR: invalid range {start}-{end} for file with {n} lines"
+        return "", "", f"ERROR: invalid range {start}-{end} for file with {n} lines"
     end = min(end, n)
-    insert = [] if new_content == "" else new_content.splitlines(keepends=True)
+    if mode == "delete":
+        new_lines = lines[: start - 1] + lines[end:]
+        return "".join(new_lines), f"deleted lines {start}-{end} ({end - start + 1} lines)", ""
+    insert = [] if not content else content.splitlines(keepends=True)
     if insert and not insert[-1].endswith("\n") and end < n:
         insert[-1] += "\n"
     new_lines = lines[: start - 1] + insert + lines[end:]
-    p.write_text("".join(new_lines), encoding="utf-8", newline="\n")
-    return f"OK: replaced lines {start}-{end} ({end - start + 1} lines) with {len(insert)} line(s) in {p}"
+    return (
+        "".join(new_lines),
+        f"replaced lines {start}-{end} ({end - start + 1} lines) with {len(insert)} line(s)",
+        "",
+    )
 
-def tool_insert_lines(path: str, after_line: int, content: str) -> str:
-    """工具实现：在指定行之后插入文本。"""
+
+def normalize_edits(args: dict) -> list[dict]:
+    """把 edit_file 的参数统一成 [{path, old_text, new_text, replace_all}, …]。"""
+    edits = args.get("edits")
+    if isinstance(edits, list) and edits:
+        out = []
+        for e in edits:
+            if isinstance(e, dict):
+                out.append(
+                    {
+                        "path": e.get("path") or args.get("path"),
+                        "old_text": e.get("old_text"),
+                        "new_text": e.get("new_text"),
+                        "replace_all": bool(e.get("replace_all", False)),
+                    }
+                )
+        return out
+    return [
+        {
+            "path": args.get("path"),
+            "old_text": args.get("old_text"),
+            "new_text": args.get("new_text"),
+            "replace_all": bool(args.get("replace_all", False)),
+        }
+    ]
+
+
+def preview_edit_file(args: dict) -> list[tuple[str, str, str, str]]:
+    """不落盘地算出 edit_file 会把每个文件改成什么样。
+    返回 [(path, old_text, new_text, error), …]，按文件聚合（同文件多处编辑顺序应用）。"""
+    per_file: dict[str, dict] = {}
+    for e in normalize_edits(args):
+        path = e.get("path")
+        if not path:
+            continue
+        p = resolve_path(str(path))
+        key = str(p)
+        slot = per_file.get(key)
+        if slot is None:
+            if not p.is_file():
+                per_file[key] = {"old": "", "new": "", "err": f"ERROR: file not found: {p}"}
+                continue
+            original = p.read_text(encoding="utf-8", errors="replace")
+            slot = per_file[key] = {"old": original, "new": original, "err": ""}
+        if slot["err"]:
+            continue
+        new, err = apply_text_edit(
+            slot["new"], str(e.get("old_text") or ""), str(e.get("new_text") or ""), e["replace_all"]
+        )
+        if err:
+            slot["err"] = err
+        else:
+            slot["new"] = new
+    return [(k, v["old"], v["new"], v["err"]) for k, v in per_file.items()]
+
+
+def preview_edit_lines(args: dict) -> tuple[str, str, str, str]:
+    """不落盘地算出 edit_lines 的结果。返回 (path, old_text, new_text, error)。"""
+    p = resolve_path(str(args.get("path") or ""))
+    if not p.is_file():
+        return str(p), "", "", f"ERROR: file not found: {p}"
+    original = p.read_text(encoding="utf-8", errors="replace")
+    new, _summary, err = apply_line_edit(
+        original,
+        str(args.get("mode") or ""),
+        args.get("start_line"),
+        args.get("end_line"),
+        args.get("content"),
+    )
+    return str(p), original, new, err
+
+
+def tool_edit_file(
+    path: str | None = None,
+    old_text: str | None = None,
+    new_text: str | None = None,
+    replace_all: bool = False,
+    edits: list[dict] | None = None,
+) -> str:
+    """工具实现：精确文本替换 old_text→new_text；传 edits=[…] 可一次改多处/多文件。"""
+    args = {
+        "path": path,
+        "old_text": old_text,
+        "new_text": new_text,
+        "replace_all": replace_all,
+        "edits": edits,
+    }
+    items = normalize_edits(args)
+    if not items:
+        return "ERROR: edits is empty"
+    msgs: list[str] = []
+    ok_count = 0
+    for e in items:
+        if not e.get("path") or e.get("old_text") is None or e.get("new_text") is None:
+            msgs.append("ERROR: path / old_text / new_text are required")
+            continue
+        p = resolve_path(str(e["path"]))
+        if not p.is_file():
+            msgs.append(f"ERROR: file not found: {p}")
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        new, err = apply_text_edit(text, str(e["old_text"]), str(e["new_text"]), e["replace_all"])
+        if err:
+            msgs.append(err)
+            continue
+        p.write_text(new, encoding="utf-8", newline="\n")
+        n = text.count(str(e["old_text"])) if e["replace_all"] else 1
+        msgs.append(f"OK: replaced {n} occurrence(s) in {p}")
+        ok_count += 1
+    if len(items) == 1:
+        return msgs[0]
+    lines = [f"[{i}] {e.get('path')}: {m}" for i, (e, m) in enumerate(zip(items, msgs), 1)]
+    return f"{ok_count}/{len(items)} succeeded\n" + "\n".join(lines)
+
+
+def tool_edit_lines(
+    path: str,
+    mode: str,
+    start_line: int,
+    end_line: int | None = None,
+    content: str | None = None,
+) -> str:
+    """工具实现：按行号 replace / insert / delete。"""
     p = resolve_path(path)
     if not p.is_file():
         return f"ERROR: file not found: {p}"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    try:
-        after = int(after_line)
-    except (TypeError, ValueError):
-        return "ERROR: after_line must be an integer"
-    if after < 0 or after > len(lines):
-        return f"ERROR: after_line {after} out of range (0..{len(lines)})"
-    if content == "":
-        return "ERROR: content is empty"
-    insert = content.splitlines(keepends=True)
-    if insert and not insert[-1].endswith("\n"):
-        insert[-1] += "\n"
-    new_lines = lines[:after] + insert + lines[after:]
-    p.write_text("".join(new_lines), encoding="utf-8", newline="\n")
-    return f"OK: inserted {len(insert)} line(s) after line {after} in {p}"
+    text = p.read_text(encoding="utf-8", errors="replace")
+    new, summary, err = apply_line_edit(text, mode, start_line, end_line, content)
+    if err:
+        return err
+    p.write_text(new, encoding="utf-8", newline="\n")
+    return f"OK: {summary} in {p}"
 
-def tool_delete_lines(path: str, start_line: int, end_line: int) -> str:
-    """工具实现：按行号删除一段内容。"""
-    p = resolve_path(path)
-    if not p.is_file():
-        return f"ERROR: file not found: {p}"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    n = len(lines)
-    try:
-        start = int(start_line)
-        end = int(end_line)
-    except (TypeError, ValueError):
-        return "ERROR: start_line/end_line must be integers"
-    if start < 1 or end < start or start > n:
-        return f"ERROR: invalid range {start}-{end} for file with {n} lines"
-    end = min(end, n)
-    new_lines = lines[: start - 1] + lines[end:]
-    p.write_text("".join(new_lines), encoding="utf-8", newline="\n")
-    return f"OK: deleted lines {start}-{end} ({end - start + 1} lines) in {p}"
 
-def tool_delete_file(path: str) -> str:
-    """工具实现：删除文件（不能删目录）。"""
-    p = resolve_path(path)
-    if not p.exists():
-        return f"ERROR: path not found: {p}"
-    if p.is_dir():
-        return f"ERROR: {p} is a directory — use run_command to remove dirs if needed"
-    p.unlink()
-    return f"OK: deleted file {p}"
-
-def tool_delete_files(paths: list[str]) -> str:
-    """工具实现：一次性删除多个文件，适合"批量删文件"的场景。
-    单条失败不影响其它条（比如某个文件已经不存在）。"""
+def tool_delete_path(paths: list[str] | str) -> str:
+    """工具实现：删除一个或多个文件（或空目录）。"""
+    if isinstance(paths, str):
+        paths = [paths]
     if not paths:
         return "ERROR: paths is empty"
     results: list[str] = []
     ok_count = 0
     for i, path in enumerate(paths, 1):
-        r = tool_delete_file(path)
-        results.append(f"[{i}] {path}: {r}")
-        if r.startswith("OK"):
-            ok_count += 1
+        p = resolve_path(str(path))
+        if not p.exists():
+            results.append(f"[{i}] ERROR: path not found: {p}")
+            continue
+        if p.is_dir():
+            try:
+                p.rmdir()
+            except OSError:
+                results.append(f"[{i}] ERROR: {p} is a non-empty directory — use run_command to remove it")
+                continue
+            results.append(f"[{i}] OK: removed empty directory {p}")
+        else:
+            p.unlink()
+            results.append(f"[{i}] OK: deleted file {p}")
+        ok_count += 1
+    if len(paths) == 1:
+        return results[0][4:]
     return f"{ok_count}/{len(paths)} succeeded\n" + "\n".join(results)
 
 def tool_move_file(src: str, dest: str) -> str:
@@ -258,12 +342,6 @@ def tool_move_file(src: str, dest: str) -> str:
         return f"ERROR: destination already exists: {d}"
     shutil.move(str(s), str(d))
     return f"OK: moved {s} -> {d}"
-
-def tool_mkdir(path: str) -> str:
-    """工具实现：创建目录（含中间目录）。"""
-    p = resolve_path(path)
-    p.mkdir(parents=True, exist_ok=True)
-    return f"OK: directory ready {p}"
 
 def tool_list_dir(path: str | None = None) -> str:
     """工具实现：列出目录下的文件和子目录。"""
@@ -418,7 +496,7 @@ def is_long_running_command(command: str) -> bool:
 
 def _run_command_background(cmd: str, work: Path, env: dict) -> str:
     """Start a long-running process, capture startup logs briefly, return."""
-    print(paint("  ⎿  ", C.DIM) + paint("后台启动中…", C.DIM, C.SPINNER_LABEL), flush=True)
+    show_note("后台启动中…")
     creationflags = 0
     if os.name == "nt":
         # 新进程组：不随 Ctrl+C 一起被误杀；不要用 DETACHED_PROCESS（会丢日志）
@@ -487,12 +565,27 @@ def _run_command_background(cmd: str, work: Path, env: dict) -> str:
         f"pid={proc.pid}\ncwd={work}{url_hint}\n"
         f"log={log_path}\n"
         f"(dev server keeps running; do not wait for it to exit; "
-        f"用 list_processes/read_process_output/kill_process 管理它)\n"
+        f"用 process(action=list|read|kill) 管理它)\n"
         f"--- startup log ---\n{out}"
     )
 
-def tool_list_processes() -> str:
-    """工具实现：列出本次会话里通过 run_command 启动的后台进程。"""
+def tool_process(action: str, pid: int | None = None, tail_lines: int | None = None) -> str:
+    """工具实现：后台进程管理。action=list 列出；read 读日志（需 pid）；kill 结束（需 pid）。"""
+    act = (action or "").strip().lower()
+    if act == "list":
+        return _proc_list()
+    if act in {"read", "log", "output"}:
+        if pid is None:
+            return "ERROR: pid is required for action=read"
+        return _proc_read(pid, tail_lines)
+    if act in {"kill", "stop"}:
+        if pid is None:
+            return "ERROR: pid is required for action=kill"
+        return _proc_kill(pid)
+    return f"ERROR: action must be list | read | kill, got {action!r}"
+
+def _proc_list() -> str:
+    """列出本次会话里通过 run_command 启动的后台进程。"""
     if not _BG_PROCESSES:
         return "(no background processes)"
     lines = []
@@ -505,15 +598,15 @@ def tool_list_processes() -> str:
         )
     return "\n".join(lines)
 
-def tool_read_process_output(pid: int, tail_lines: int | None = None) -> str:
-    """工具实现：读取某个后台进程的日志；tail_lines 可只看最后 N 行。"""
+def _proc_read(pid: int, tail_lines: int | None = None) -> str:
+    """读取某个后台进程的日志；tail_lines 可只看最后 N 行。"""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return "ERROR: pid must be an integer"
     info = _BG_PROCESSES.get(pid)
     if not info:
-        return f"ERROR: no known background process with pid={pid}（先用 list_processes 查看）"
+        return f"ERROR: no known background process with pid={pid}（先用 process(action=list) 查看）"
     log_path = Path(info["log_path"])
     try:
         text = decode_subprocess_output(log_path.read_bytes())
@@ -530,15 +623,15 @@ def tool_read_process_output(pid: int, tail_lines: int | None = None) -> str:
     status = "running" if proc.poll() is None else f"exited(code={proc.returncode})"
     return f"pid={pid}  status={status}\nlog={log_path}\n\n{truncated_note}{text or '(empty log)'}"
 
-def tool_kill_process(pid: int) -> str:
-    """工具实现：结束某个后台进程（含子进程树）。"""
+def _proc_kill(pid: int) -> str:
+    """结束某个后台进程（含子进程树）。"""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return "ERROR: pid must be an integer"
     info = _BG_PROCESSES.get(pid)
     if not info:
-        return f"ERROR: no known background process with pid={pid}（先用 list_processes 查看）"
+        return f"ERROR: no known background process with pid={pid}（先用 process(action=list) 查看）"
     proc = info["proc"]
     if proc.poll() is not None:
         _BG_PROCESSES.pop(pid, None)
@@ -592,7 +685,7 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
     if is_long_running_command(cmd):
         return _run_command_background(cmd, work, env)
 
-    print(paint("  ⎿  ", C.DIM) + paint("running…", C.DIM, C.SPINNER_LABEL), flush=True)
+    show_note("running…")
     try:
         proc = subprocess.run(
             cmd,
@@ -617,11 +710,6 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
         out = out[:12_000] + "\n...[truncated]"
     note = f"\n(executed: {cmd})" if cmd != command.strip() else ""
     return f"exit={proc.returncode}\ncwd={work}{note}\n{out}"
-
-def tool_get_datetime() -> str:
-    """工具实现：返回当前本地日期时间。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
-
 
 # ========================================================================
 #  Todo / 计划清单（会话内内存，/clear_cache 时清空）
@@ -655,9 +743,18 @@ def _format_todos() -> str:
     return header + "\n" + "\n".join(lines)
 
 
-def tool_todo_read() -> str:
-    """返回当前会话的计划清单。"""
-    return "OK:\n" + _format_todos()
+def get_todos() -> list[dict[str, str]]:
+    """当前会话 todo 的副本（会话保存用）。"""
+    return [dict(t) for t in _TODOS]
+
+
+def set_todos(items: list[dict]) -> None:
+    """恢复会话时回填 todo。"""
+    _TODOS[:] = [
+        {"id": str(t.get("id", "")), "content": str(t.get("content", "")), "status": str(t.get("status", "pending"))}
+        for t in items
+        if isinstance(t, dict)
+    ]
 
 
 _TODO_CONTENT_KEYS = ("content", "task", "text", "title", "description", "name")
@@ -969,7 +1066,7 @@ def tool_web_search(query: str) -> str:
             "If you know a docs URL, try fetch_url directly."
         )
 
-    print(paint("  ⎿  ", C.DIM) + paint("searching…", C.DIM, C.SPINNER_LABEL), flush=True)
+    show_note("searching…")
 
     results, err = _search_tavily(q)
 
@@ -996,7 +1093,7 @@ def tool_fetch_url(url: str) -> str:
     u = (url or "").strip()
     if not u.startswith(("http://", "https://")):
         return "ERROR: url must start with http:// or https://"
-    print(paint("  ⎿  ", C.DIM) + paint("fetching…", C.DIM, C.SPINNER_LABEL), flush=True)
+    show_note("fetching…")
     try:
         html = _http_get(u, timeout=25)
     except Exception as e:

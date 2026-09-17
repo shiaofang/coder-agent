@@ -1,9 +1,29 @@
 {
-  "provider": "cloud",
+  "provider": "local",
   "host": "127.0.0.1",
   "port": 8080,
-  "base_url": "https://ollama.com",
-  "model": "gpt-oss:120b-cloud",
+
+  "base_url": "",
+  "model": "",
   "api_key": "",
-  "tavily_api_key": ""
+
+  "tavily_api_key": "",
+
+  "server": {
+    "fit_margin": 384,
+    "fit_ctx": 16384,
+    "ngl": null,
+    "ctx": null,
+    "extra_args": []
+  },
+
+  "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "repeat_penalty": null
+  },
+
+  "prompt_tier": "auto"
 }

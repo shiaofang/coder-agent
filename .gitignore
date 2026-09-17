@@ -19,6 +19,11 @@ bin/
 config.json
 cloud_config.json
 
+# Runtime state
+sessions/
+.history
+.last_model
+
 # IDE / OS
 .idea/
 .vscode/

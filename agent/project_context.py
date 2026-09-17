@@ -233,8 +233,8 @@ def _readme_blurb(cwd: Path) -> str:
     return ""
 
 
-def gather_project_context(cwd: Path | None = None) -> str:
-    """收集当前目录的项目上下文；无内容时返回空串。"""
+def gather_project_context(cwd: Path | None = None, max_chars: int = _MAX_CONTEXT_CHARS) -> str:
+    """收集当前目录的项目上下文；无内容时返回空串。max_chars 由调用方按 n_ctx 决定。"""
     root = (cwd or Path.cwd()).resolve()
     sections: list[str] = []
 
@@ -261,6 +261,6 @@ def gather_project_context(cwd: Path | None = None) -> str:
         sections.append(readme)
 
     text = "\n\n".join(sections).strip()
-    if len(text) > _MAX_CONTEXT_CHARS:
-        text = text[:_MAX_CONTEXT_CHARS].rstrip() + "\n…[project context truncated]"
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n…[project context truncated]"
     return text
