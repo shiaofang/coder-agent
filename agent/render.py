@@ -451,6 +451,9 @@ def show_banner(cwd: str) -> None:
         if config.MODEL_PARAMS_B:
             lines.append(f"  {config.MODEL_PARAMS_B:g}B", style="dim")
         lines.append(f"  提示词 {config.prompt_tier()}", style="dim")
+        lines.append("\n网页  ", style="dim")
+        lines.append(f"http://{config.HOST}:{config.PORT}", style="blue underline")
+        lines.append("  (llama-server 自带聊天界面)", style="dim")
     lines.append("\n目录  ", style="dim")
     lines.append(cwd, style="blue")
     lines.append("\n\n")

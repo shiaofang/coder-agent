@@ -4,6 +4,25 @@
 
 只依赖两个 Python 库（`rich` 渲染、`prompt_toolkit` 输入），不依赖 LangChain 等框架。
 
+> 三步跑起来：① 把 `llama-server` 放进 `bin/` ② 把 GGUF 模型放进 `models/` ③ 双击 `start.bat`。
+> 细节见下方 [快速开始](#快速开始)。
+
+## 目录
+
+- [特性](#特性)
+- [目录结构](#目录结构)
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+  - [1. 准备 `bin/`（llama-server 运行时）](#1-准备-binllama-server-运行时)
+  - [2. 准备 `models/`（GGUF 模型）](#2-准备-modelsgguf-模型)
+  - [3. 启动](#3-启动)
+  - [4. 配置文件 `config.json`](#4-配置文件-configjson)
+- [使用说明](#使用说明)（输入 / 斜杠命令 / 确认 / 上下文 / 工具）
+- [云端模型（可选）](#云端模型可选)
+- [工作原理](#工作原理简要)
+- [常见问题](#常见问题)
+- [安全提示](#安全提示)
+
 ## 特性
 
 - **本地推理**：模型与对话都在本机，不经过云端 API；启动时选 GGUF，`/model` 会话内随时切换
@@ -58,19 +77,67 @@ coder-agent/
 
 ## 快速开始
 
-### 1. 准备 `bin/`（llama-server）
+### 1. 准备 `bin/`（llama-server 运行时）
 
-来源：[llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases)。按机器选择并解压到 `bin/`：
+`bin/` 放的是 llama.cpp 官方预编译的 `llama-server` 可执行文件和它依赖的全部 DLL。本项目**不自带**这些文件（体积大、与显卡/CUDA 版本相关），需要你按自己的机器下载一次。
 
-| 场景 | 下载（名称随版本变化） |
-|------|------------------------|
-| 仅 CPU | `llama-b*-bin-win-cpu-x64.zip` |
-| NVIDIA + CUDA 12 | `llama-b*-bin-win-cuda-12.*-x64.zip`，另下 `cudart-llama-bin-win-cuda-12.*-x64.zip` |
-| NVIDIA + CUDA 13 | `llama-b*-bin-win-cuda-13.*-x64.zip`，另下 `cudart-llama-bin-win-cuda-13.*-x64.zip` |
+#### 1.1 下载哪个包
 
-最终至少要有 `bin/llama-server.exe` 和同包（及 cudart 包）中的全部 DLL。
+来源：[llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases)。每个 Release 底部的 Assets 里按你的机器选：
 
-### 2. 准备 `models/`（GGUF）
+| 你的机器 | 下载的压缩包（`b*` 是版本号，随时间变化） |
+|----------|------------------------------------------|
+| 只有 CPU，没独显 | `llama-b****-bin-win-cpu-x64.zip` |
+| NVIDIA 显卡 + CUDA 12 | `llama-b****-bin-win-cuda-12.*-x64.zip` **＋** `cudart-llama-bin-win-cuda-12.*-x64.zip` |
+| NVIDIA 显卡 + CUDA 13 | `llama-b****-bin-win-cuda-13.*-x64.zip` **＋** `cudart-llama-bin-win-cuda-13.*-x64.zip` |
+
+- 有 N 卡就选 CUDA 包，能把模型层放到 GPU 上、快很多；CUDA 包**必须**再额外下同版本的 `cudart-*` 包（里面是 NVIDIA 运行时 DLL），否则会报缺 `cudart64_12.dll` 之类的错。
+- CUDA 12 还是 13：用 `nvidia-smi` 看右上角 "CUDA Version"，选不超过它的那个大版本即可（比如显示 12.4 就用 CUDA 12 包）。
+- 不确定 / 没独显：先用 CPU 包能跑通，只是慢。
+- 也可以自己从 [llama.cpp 源码](https://github.com/ggml-org/llama.cpp) 编译，把产物拷进 `bin/`。
+
+#### 1.2 怎么放
+
+把 `llama-*.zip` 和 `cudart-*.zip` 里的文件**全部解压到 `bin/` 根目录**（不要保留多一层子文件夹）。两个压缩包的内容直接合并放一起。
+
+#### 1.3 放好后 `bin/` 里应该有什么
+
+以本机一份可用的 CUDA 12 版本为例，`bin/` 里的文件及作用：
+
+| 文件 | 来自哪个包 | 作用 |
+|------|-----------|------|
+| `llama-server.exe` | llama 包 | **主程序**，启动后提供 `127.0.0.1:8080` 的 HTTP 接口（本项目就是连它） |
+| `llama-server-impl.dll` | llama 包 | server 的实际实现（`.exe` 只是瘦启动器） |
+| `llama.dll` / `llama-common.dll` | llama 包 | llama.cpp 推理核心 |
+| `ggml.dll` / `ggml-base.dll` | llama 包 | ggml 张量计算框架（所有后端的基础） |
+| `ggml-cpu-haswell.dll` | llama 包 | **CPU 计算后端**（Haswell 及以上 CPU；GPU 放不下的层落到这里算） |
+| `ggml-cuda.dll` | CUDA 包 | **GPU 计算后端**（约 500MB，只有 CUDA 版才有） |
+| `mtmd.dll` | llama 包 | 多模态支持（挂 `mmproj` 看图时用到） |
+| `libomp.dll` | llama 包 | OpenMP 并行运行时 |
+| `cudart64_12.dll` | **cudart 包** | NVIDIA CUDA 运行时 |
+| `cublas64_12.dll` / `cublasLt64_12.dll` | **cudart 包** | NVIDIA 矩阵运算库（GPU 加速的关键） |
+| `LICENSE-LLVM-OpenMP` | llama 包 | 许可证文件，放着不用管 |
+
+> 关键点：只有 `llama-server.exe` 一个 `.exe`，其余全是它依赖的 `.dll`，**缺一个都可能起不来或报错**。所以务必把压缩包里的 DLL 全部拷进来，不要只挑 `.exe`。CPU 版没有 `ggml-cuda.dll` 和三个 CUDA 运行时 DLL，这是正常的。
+
+#### 1.4 验证是否可用
+
+在仓库根目录执行，能打印版本号就说明 `bin/` 齐全：
+
+```bat
+bin\llama-server.exe --version
+```
+
+正常输出类似：
+
+```
+version: 0.4.1-dev (build 11010, commit 4bc272fd7)
+built with Clang 20.1.8 for Windows x86_64
+```
+
+如果报「找不到 xxx.dll」或直接闪退，多半是 DLL 没拷全（尤其是 CUDA 版忘了下 `cudart-*` 包）。
+
+### 2. 准备 `models/`（GGUF 模型）
 
 来源：[Hugging Face](https://huggingface.co/) 上的 GGUF 仓库。推荐（支持 tool calling）：
 
@@ -222,6 +289,18 @@ copy config.example.json config.json
 | OpenAI | `https://api.openai.com` | `gpt-4o` 等 | OpenAI API Key |
 
 要跳过菜单直接进云端：`set CODER_AGENT_PROVIDER=cloud` 后 `python chat.py`。
+
+## 常见问题
+
+| 现象 | 原因 / 处理 |
+|------|-------------|
+| 双击 `start.bat` 窗口一闪而过，什么都没有 | 多半是 Python 没装或没加进 PATH。在命令行 `python --version` 确认；也可以在窗口里手动 `python chat.py` 看报错 |
+| 提示找不到 `xxx.dll` / `llama-server` 闪退 | `bin/` 的 DLL 没拷全。重看 [1.3](#13-放好后-bin-里应该有什么)，CUDA 版记得连 `cudart-*` 包一起解压 |
+| 模型加载失败，日志里有 `out of memory` | 显存不够。调小 `config.json` 的 `server.fit_ctx`（如 `8192`），或调大 `server.fit_margin` |
+| 起来了但很慢（个位数 tok/s） | GPU 放不下、层落到了 CPU。换更小的量化档（Q4）、调小上下文，或用参数量更小的模型 |
+| `HTTP 401 Unauthorized`（云端） | `config.json` 的 `api_key` 无效或过期，去对应平台重新生成 |
+| 模型不调用工具 / 只会聊天 | 该 GGUF 不支持 tool calling，换支持的模型（如 Qwen3.5 系列） |
+| `web_search` 用不了 | 没配 `tavily_api_key`；不配的话这个工具根本不会出现，属正常 |
 
 ## 工作原理（简要）
 

@@ -317,7 +317,10 @@ def main() -> int:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             error(f"HTTP {e.code}: {detail[:600]}")
-            if e.code in (400, 413) and ("context" in detail.lower() or "token" in detail.lower()):
+            if e.code in (401, 403):
+                warn("云端接口不认这个 api_key：检查 config.json 的 api_key 是否有效/完整，"
+                     "Ollama 的 key 在 ollama.com/settings/keys 重新生成")
+            elif e.code in (400, 413) and ("context" in detail.lower() or "token" in detail.lower()):
                 warn("很可能是上下文超限：试试 /compact，或 /new 开新会话")
             del messages[turn_start:]
             continue

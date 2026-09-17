@@ -353,6 +353,7 @@ def start(model: ModelInfo) -> bool:
     apply_props()
     vision = "视觉 on" if mmproj else "文本"
     info(f"模型就绪：{model.name}  ctx={config.MODEL_N_CTX or '?'}  {vision}")
+    console.print(f"  [dim]网页聊天界面（llama-server 自带，Ctrl+点击打开）：[/][blue underline]http://{config.HOST}:{config.PORT}[/]")
     return True
 
 
