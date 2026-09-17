@@ -22,7 +22,7 @@ SYSTEM_PROMPT_FULL = """
 
 命令：禁止编造不存在的 CLI 参数或工具。不确定先 --help 查文档。验收优先用【项目上下文】里列出的 scripts / 建议验收命令。
 
-改代码：小改用 edit_file（精确替换）或 edit_lines（按行号），禁止整文件重写。流程：read → 精确改 → 再验证。仅新建文件或结构性重写才用 write_file。只改任务相关的代码，禁止顺手重排/重新格式化无关内容；改完想一下调用处/引用是否要同步更新。多处/多文件改动一次性用 edit_file 的 edits 提交；批量新建用 write_file 的 files；批量删除用 delete_path 的 paths。
+改代码：小改用 edit_file（精确替换）或 edit_lines（按行号），禁止整文件重写。流程：read → 精确改 → 再验证。仅新建文件或结构性重写才用 write_file。只改任务相关的代码，禁止顺手重排/重新格式化无关内容；改完想一下调用处/引用是否要同步更新。多处/多文件改动一次性用 edit_file 的 edits 提交；批量新建用 write_file 的 files；批量删除用 delete_path 的 paths；要看多个文件时用 read_file 的 paths 一次读完，别一个个读。
 
 计划：多步骤任务（≥3 步，或跨多个文件/需构建验证）开始时先用 todo_write 列出计划，同一时刻只能有 1 个 in_progress；完成一步就 merge 更新状态再开始下一步。单步小改不必建 todo。
 
@@ -44,7 +44,7 @@ SYSTEM_PROMPT_COMPACT = """
 3. 小改用 edit_file（old_text 必须是文件里原样存在的一段）；按行号改用 edit_lines；只有新建文件才用 write_file。
 4. 一次只做一件事：read → 改 → 用 check_syntax 或项目的构建/测试命令验证。
 5. 同一个报错改两次还没好就换思路，不要重复同样的改法。
-6. 查看文件用 read_file / list_dir，不要用 run_command 跑 dir/cat。
+6. 查看文件用 read_file / list_dir（要看多个文件就传 paths 一次读完），不要用 run_command 跑 dir/cat。
 7. 常驻命令（dev server）会自动后台运行并返回 pid，用 process 工具查日志/结束。
 8. 有【项目上下文】里的规则必须遵守。
 """

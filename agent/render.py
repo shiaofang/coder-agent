@@ -230,6 +230,9 @@ def _looks_like_ordered_item(text: str) -> bool:
 def tool_summary(name: str, args: dict) -> str:
     """一行概括「模型准备调用哪个工具」。"""
     if name == "read_file":
+        paths = args.get("paths")
+        if isinstance(paths, list) and paths:
+            return f"{len(paths)} 个文件  {', '.join(str(p) for p in paths)}"
         s = str(args.get("path", ""))
         if args.get("start_line") or args.get("end_line"):
             s += f"  L{args.get('start_line', '?')}-{args.get('end_line', '?')}"

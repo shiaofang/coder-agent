@@ -27,12 +27,17 @@ from agent.render import show_note
 # 只在内存里维护，agent 进程退出后自然清空。
 _BG_PROCESSES: dict[int, dict] = {}
 
-def tool_read_file(
+# 一次 read_file 最多读几个文件；再多模型也消化不了，还会挤爆上下文
+MAX_READ_BATCH = 10
+
+
+def _read_one(
     path: str,
     start_line: int | None = None,
     end_line: int | None = None,
+    budget: int = MAX_READ_CHARS,
 ) -> str:
-    """工具实现：读取文本文件，输出带行号，便于按行修改。"""
+    """读单个文件并排版成带行号的文本；budget 是本次允许返回的最大字符数。"""
     p = resolve_path(path)
     if not p.exists():
         return f"ERROR: file not found: {p}"
@@ -57,9 +62,42 @@ def tool_read_file(
     body = "\n".join(f"{i:>{width}}|{line}" for i, line in enumerate(chunk, start))
     header = f"{p}  lines {start}-{end}/{total}\n"
     text = header + body
-    if len(text) > MAX_READ_CHARS:
-        return text[:MAX_READ_CHARS] + f"\n\n...[truncated, showing partial of {total} lines]"
+    if len(text) > budget:
+        return text[:budget] + f"\n\n...[truncated, showing partial of {total} lines]"
     return text
+
+
+def tool_read_file(
+    path: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    paths: list[str] | None = None,
+) -> str:
+    """工具实现：读取文本文件，输出带行号，便于按行修改。
+    传 paths=[…] 可一次读多个文件（各自整篇读，忽略 start_line/end_line）。"""
+    if paths:
+        if isinstance(paths, str):
+            paths = [paths]
+        if not isinstance(paths, list):
+            return "ERROR: paths must be an array of file paths"
+        items = [str(x) for x in paths if str(x).strip()]
+        if not items:
+            return "ERROR: paths is empty"
+        skipped = ""
+        if len(items) > MAX_READ_BATCH:
+            skipped = (
+                f"\n\n...[skipped {len(items) - MAX_READ_BATCH} more file(s); "
+                f"一次最多读 {MAX_READ_BATCH} 个]"
+            )
+            items = items[:MAX_READ_BATCH]
+        # 总量仍受 MAX_READ_CHARS 约束，按文件数平分，避免一个大文件吃掉整个上下文
+        budget = max(4_000, MAX_READ_CHARS // len(items))
+        blocks = [f"===== [{i}/{len(items)}] {name} =====\n{_read_one(name, budget=budget)}"
+                  for i, name in enumerate(items, 1)]
+        return "\n\n".join(blocks) + skipped
+    if not path:
+        return "ERROR: path is required (or pass paths=[…])"
+    return _read_one(path, start_line, end_line)
 
 def _write_one(path: str, content: str) -> str:
     p = resolve_path(path)

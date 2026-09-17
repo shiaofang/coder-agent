@@ -25,13 +25,17 @@ def _fn(name: str, description: str, properties: dict, required: list[str] | Non
 TOOLS: list[dict] = [
     _fn(
         "read_file",
-        "读文件，带行号。可用 start_line/end_line 只读片段。",
+        "读文件，带行号。可用 start_line/end_line 只读片段。要看多个文件时传 paths 一次读完。",
         {
             "path": _PATH,
             "start_line": {"type": "integer"},
             "end_line": {"type": "integer"},
+            "paths": {
+                "type": "array",
+                "description": "批量：一次读多个文件，各读整篇，最多 10 个",
+                "items": _PATH,
+            },
         },
-        ["path"],
     ),
     _fn(
         "write_file",
