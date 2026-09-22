@@ -246,6 +246,7 @@ def _build_cmd(model: ModelInfo, mmproj: Path | None) -> list[str]:
         "--port", str(config.PORT),
         "-np", "1",
         "--jinja",
+        "--tools", "all",
     ]
     # 没写死 -ngl/-c 时交给 --fit 按空闲显存自适应
     if srv.get("ngl") is not None:
@@ -314,7 +315,9 @@ def start(model: ModelInfo) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
-            cwd=str(config.BIN_DIR),
+            # llama-server 的内置文件工具以进程 cwd 解析相对路径。
+            # 指向项目根目录，网页里可直接读写当前项目而不是 bin/。
+            cwd=str(config.ROOT_DIR),
         )
     except OSError as e:
         error(f"启动 llama-server 失败：{e}")

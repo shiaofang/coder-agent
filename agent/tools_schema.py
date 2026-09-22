@@ -25,7 +25,7 @@ def _fn(name: str, description: str, properties: dict, required: list[str] | Non
 TOOLS: list[dict] = [
     _fn(
         "read_file",
-        "读文件，带行号。可用 start_line/end_line 只读片段。要看多个文件时传 paths 一次读完。",
+        "读文件，带行号。大文件优先用 start_line/end_line 读相关片段；要看多个文件时传 paths 一次读完。",
         {
             "path": _PATH,
             "start_line": {"type": "integer"},
@@ -56,7 +56,7 @@ TOOLS: list[dict] = [
     ),
     _fn(
         "edit_file",
-        "精确替换 old_text→new_text（首选改法）。多处/多文件传 edits，逐条执行。",
+        "精确替换 old_text→new_text（两者必须不同）。仅在确有修改时调用；多处/多文件传 edits。",
         {
             "path": _PATH,
             "old_text": {"type": "string", "description": "原文，需唯一"},
@@ -103,7 +103,7 @@ TOOLS: list[dict] = [
     ),
     _fn(
         "list_dir",
-        "列目录。",
+        "列目录。结果中 [FILE]/[DIR] 是类型标记，不是文件名；调用后续工具时只复制标记后面的完整路径。",
         {"path": {"type": "string", "description": "默认当前目录"}},
     ),
     _fn(
@@ -124,7 +124,7 @@ TOOLS: list[dict] = [
     ),
     _fn(
         "run_command",
-        "执行 shell 命令。dev server 等常驻命令自动转后台并返回 pid。",
+        "执行 shell 命令。项目脚本必须真实存在，验收命令不得用 || true 掩盖失败；用 cwd 指定目录。dev server 自动转后台。",
         {"command": {"type": "string"}, "cwd": {"type": "string"}},
         ["command"],
     ),
@@ -140,9 +140,18 @@ TOOLS: list[dict] = [
     ),
     _fn(
         "check_syntax",
-        "快速语法检查 .py/.json/.js；不代替构建/测试。",
+        "文件级静态检查，支持 .html/.htm/.py/.json/.js/.jsx/.mjs/.cjs；不代替项目 build/lint/test 或浏览器验证。",
         {"path": _PATH},
         ["path"],
+    ),
+    _fn(
+        "check_webpage",
+        "用无头 Chrome/Edge 实际运行 HTML 或网页，检查 console.error、JS 异常、请求失败和 HTTP 错误；不验证视觉效果。",
+        {
+            "path": {"type": "string", "description": "本地 .html/.htm 完整路径；与 url 二选一"},
+            "url": {"type": "string", "description": "http(s) 页面地址；与 path 二选一"},
+            "wait_ms": {"type": "integer", "description": "页面加载后等待异步错误的毫秒数，默认 2000"},
+        },
     ),
     _fn(
         "todo_write",

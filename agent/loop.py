@@ -15,8 +15,8 @@ from agent import config, context
 from agent.config import MAX_REASONING_ABORTS, MAX_TOOL_ROUNDS
 from agent.model import chat_once
 from agent.render import console, error, show_tool_call, show_tool_result, show_turn_stats, warn
-from agent.terminal import ask_tool_approval, flush_input_buffer
-from agent.tools import execute_tool
+from agent.terminal import TOOL_SKIPPED_MESSAGE, ask_tool_approval, flush_input_buffer
+from agent.tools import execute_tool, preflight_run_command
 
 _EDIT_TOOLS = {"edit_file", "edit_lines"}
 _WRITE_TOOLS = _EDIT_TOOLS | {"write_file"}
@@ -133,6 +133,7 @@ def run_agent_turn(messages: list[dict]) -> None:
     reasoning_abort_count = 0
     research_call_count = 0  # 连续 web_search/fetch_url 次数，中间没有真正去改代码
     grep_streak = 0  # 连续 grep_search 次数，用于识别"逐个属性瞎猜"
+    failed_path_counts: dict[str, int] = {}  # 同一路径反复不存在时，明确阻止把类型标记当路径
     # 本轮开始时的消息长度：中断时丢掉未完成的 assistant/tool 片段，保留用户消息
     start_len = len(messages)
 
@@ -219,17 +220,51 @@ def run_agent_turn(messages: list[dict]) -> None:
                             )
                             show_tool_call(name, args)
                             show_tool_result(result, name)
+                        elif name == "run_command" and recent_sigs and recent_sigs[-1] == sig:
+                            result = (
+                                "SKIPPED: 与上一次完全相同的命令已经执行，期间没有其它工具改变状态。"
+                                "禁止重复运行；直接解释上一次结果或继续下一步。"
+                                "如果输出是 TCP TIME_WAIT，它表示连接已关闭，不是服务仍在运行。"
+                            )
+                            show_tool_call(name, args)
+                            show_tool_result(result, name)
                         else:
                             show_tool_call(name, args)
-                            approved, reason = ask_tool_approval(name, args)
-                            if not approved:
-                                result = "ERROR: user denied tool execution"
-                                if reason:
-                                    result += f". 用户说明：{reason}"
+                            preflight = ""
+                            if name == "run_command":
+                                preflight = preflight_run_command(
+                                    str(args.get("command") or ""),
+                                    str(args["cwd"]) if args.get("cwd") else None,
+                                )
+                            if preflight:
+                                result = preflight
                                 show_tool_result(result, name)
                             else:
-                                result = execute_tool(name, args)
-                                show_tool_result(result, name)
+                                approved, reason = ask_tool_approval(name, args)
+                                if not approved:
+                                    if reason == TOOL_SKIPPED_MESSAGE:
+                                        result = TOOL_SKIPPED_MESSAGE
+                                    else:
+                                        result = "ERROR: user denied tool execution"
+                                        if reason:
+                                            result += f". 用户说明：{reason}"
+                                    show_tool_result(result, name)
+                                else:
+                                    result = execute_tool(name, args)
+                                    path_arg = args.get("path") or args.get("root")
+                                    if path_arg:
+                                        path_key = str(path_arg).strip().lower()
+                                        if result.startswith(("ERROR", "FAIL")):
+                                            failed_path_counts[path_key] = failed_path_counts.get(path_key, 0) + 1
+                                            if failed_path_counts[path_key] >= 2:
+                                                result += (
+                                                    "\n\nINVALID_PATH_LOOP: 这个路径已经连续失败。禁止再次使用或搜索同名路径。"
+                                                    "如果它来自 list_dir，请注意 [FILE]/[DIR] 只是类型标记，"
+                                                    "必须复制标记后面的完整路径；先使用最近一次 list_dir 返回的真实路径。"
+                                                )
+                                        else:
+                                            failed_path_counts.pop(path_key, None)
+                                    show_tool_result(result, name)
                             recent_sigs.append(sig)
                             if len(recent_sigs) > 24:
                                 recent_sigs = recent_sigs[-24:]

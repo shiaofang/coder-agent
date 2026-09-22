@@ -12,6 +12,7 @@ from pathlib import Path
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.spinner import Spinner
 from rich.text import Text
 
 from agent import config
@@ -93,6 +94,7 @@ class StreamRenderer:
         self._mode = ""  # "" | "think" | "reply"
         self._reasoning: list[str] = []
         self._think_started = 0.0
+        self._think_spinner = Spinner("dots", text=" 思考中…", style="magenta")
         self._pending = ""  # 尚未 flush 的 markdown 段落
         self._replied = False
 
@@ -125,8 +127,7 @@ class StreamRenderer:
             full = "".join(self._reasoning)
             tail = full.strip().splitlines()[-_THINK_TAIL_LINES:]
             body = Text("\n".join("  " + ln for ln in tail), style="dim italic")
-            head = Text("∴ Thinking…", style="magenta")
-            self._live.update(Group(head, body))
+            self._live.update(Group(self._think_spinner, body))
 
     def _end_thinking(self) -> None:
         if self._mode != "think":
@@ -269,7 +270,9 @@ def tool_summary(name: str, args: dict) -> str:
         if args.get("pid") is not None:
             s += f"  pid={args.get('pid')}"
         return s
-    if name in {"list_dir", "check_syntax"}:
+    if name in {"list_dir", "check_syntax", "check_webpage"}:
+        if name == "check_webpage" and args.get("url"):
+            return str(args.get("url", ""))
         return str(args.get("path", ""))
     if name == "glob_search":
         return str(args.get("pattern", ""))
@@ -304,7 +307,7 @@ def show_tool_call(name: str, args: dict) -> None:
 def show_tool_result(result: str, name: str = "") -> None:
     """折叠显示工具结果：默认前几行 + 「… 还有 N 行」；/verbose 全量。"""
     ok = not (result.startswith("ERROR") or result.startswith("FAIL") or _has_nonzero_exit(result))
-    style = "green" if ok else "red"
+    style = "yellow" if result.startswith("SKIPPED:") else "green" if ok else "red"
     lines = result.rstrip().splitlines() or ["(empty)"]
     limit = len(lines) if config.VERBOSE else (_RESULT_LINES_COMMAND if name == "run_command" else _RESULT_LINES_DEFAULT)
     shown = lines[:limit]
@@ -372,30 +375,38 @@ def _render_new_file(path: str, content: str) -> Text:
     return out
 
 
-def show_change_preview(name: str, args: dict) -> None:
-    """写/改文件前展示将要发生的变化（diff 或新文件预览）。"""
+def show_change_preview(name: str, args: dict) -> bool:
+    """写/改文件前展示变化；返回是否至少有一个可执行的变更。"""
     from agent.tools import preview_edit_file, preview_edit_lines
 
     try:
         if name == "edit_file":
-            for path, old, new, err in preview_edit_file(args):
+            previews = preview_edit_file(args)
+            valid = False
+            for path, old, new, err in previews:
                 if err:
                     console.print(f"  [red]{err}[/]")
                 else:
+                    valid = True
                     console.print(_render_diff(old, new, path))
+            return valid
         elif name == "edit_lines":
             path, old, new, err = preview_edit_lines(args)
             if err:
                 console.print(f"  [red]{err}[/]")
+                return False
             else:
                 console.print(_render_diff(old, new, path))
+                return True
         elif name == "write_file":
             items = args.get("files") if isinstance(args.get("files"), list) else None
             if not items:
                 items = [{"path": args.get("path"), "content": args.get("content", "")}]
+            valid = False
             for f in items:
                 if not isinstance(f, dict) or not f.get("path"):
                     continue
+                valid = True
                 p = resolve_path(str(f["path"]))
                 content = str(f.get("content") or "")
                 if p.is_file():
@@ -406,8 +417,10 @@ def show_change_preview(name: str, args: dict) -> None:
                         console.print(_render_diff(old, content, str(p)))
                 else:
                     console.print(_render_new_file(str(p), content))
+            return valid
     except Exception as e:  # 预览失败不阻塞确认
         console.print(f"  [dim]（无法生成预览：{type(e).__name__}: {e}）[/]")
+    return True
 
 
 # ========================================================================

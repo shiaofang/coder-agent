@@ -82,8 +82,14 @@ def flush_input_buffer() -> None:
 #  单键读取（确认菜单用）
 # ========================================================================
 
+TOOL_SKIPPED_MESSAGE = (
+    "SKIPPED: 用户选择暂不处理此操作。不要再次提出相同修改；"
+    "继续检查其它问题，或总结已发现的问题后结束。"
+)
+
+
 def _read_key() -> str:
-    """up / down / enter / esc / 1 / 2 / other"""
+    """up / down / enter / esc / 1 / 2 / 3 / other"""
     if os.name == "nt":
         import msvcrt
 
@@ -111,7 +117,7 @@ def _read_key() -> str:
         return "esc"
     if ch == "\x03":
         raise KeyboardInterrupt
-    if ch in ("1", "2"):
+    if ch in ("1", "2", "3"):
         return ch
     if ch.lower() == "q":
         return "esc"
@@ -138,11 +144,14 @@ def ask_tool_approval(name: str, args: dict) -> tuple[bool, str]:
         return True, ""
 
     if name in {"write_file", "edit_file", "edit_lines"}:
-        show_change_preview(name, args)
+        if not show_change_preview(name, args):
+            show_note("编辑参数无效，跳过确认并将错误返回给模型")
+            return True, ""
 
     options = [
         ("执行", "仅本次"),
         ("自动执行", "本轮任务内不再询问"),
+        ("暂不处理", "跳过此操作，继续检查或总结"),
     ]
     idx = 0
 
@@ -171,6 +180,8 @@ def ask_tool_approval(name: str, args: dict) -> tuple[bool, str]:
                 idx, key = 0, "enter"
             elif key == "2":
                 idx, key = 1, "enter"
+            elif key == "3":
+                idx, key = 2, "enter"
             elif key == "esc":
                 flush_input_buffer()
                 try:
@@ -180,6 +191,10 @@ def ask_tool_approval(name: str, args: dict) -> tuple[bool, str]:
                 console.print("  [red]✗ 已拒绝[/]" + (f"[dim]：{reason}[/]" if reason else ""))
                 return False, reason
             if key == "enter":
+                if idx == 2:
+                    console.print("  [yellow]○ 已暂不处理此操作[/]")
+                    flush_input_buffer()
+                    return False, TOOL_SKIPPED_MESSAGE
                 if idx == 1:
                     config.AUTO_APPROVE = True
                     console.print("  [cyan]✓ 本轮自动执行（下一条消息会重新询问）[/]")

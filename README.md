@@ -2,7 +2,7 @@
 
 本地终端 AI 编程助手。基于 [llama.cpp](https://github.com/ggerganov/llama.cpp) 的 `llama-server`，在本机跑 GGUF 模型，通过 OpenAI 兼容的 tool calling 直接改文件、执行命令、搜索网页。
 
-只依赖两个 Python 库（`rich` 渲染、`prompt_toolkit` 输入），不依赖 LangChain 等框架。
+只依赖三个 Python 库（`rich` 渲染、`prompt_toolkit` 输入、`playwright` 无头浏览器控制），不依赖 LangChain 等框架。
 
 > 三步跑起来：① 把 `llama-server` 放进 `bin/` ② 把 GGUF 模型放进 `models/` ③ 双击 `start.bat`。
 > 细节见下方 [快速开始](#快速开始)。
@@ -28,8 +28,10 @@
 - **本地推理**：模型与对话都在本机，不经过云端 API；启动时选 GGUF，`/model` 会话内随时切换
 - **真干活**：不只给步骤，会读改文件、跑命令、（配了 Key 时）联网查报错
 - **改动可审查**：写文件 / 改文件前显示彩色 diff，方向键确认；拒绝时可写一句原因告诉模型
+- **网页运行检查**：用系统 Chrome / Edge 无头运行 HTML，捕获控制台、JS 与资源加载错误，不弹浏览器窗口
+- **网页工具**：自带 Web UI 已启用 llama-server 全部内置工具，可读写项目文件、搜索内容和执行命令
 - **上下文可见可控**：状态栏实时显示 ctx 用量；快满时自动折叠旧工具结果 / 总结旧对话，`/compact` 手动压缩
-- **为小模型优化**：工具集精简到 14 个（≈1.5k token），≤5B 模型自动用更短的提示词，工具参数 JSON 容错修复，`/think off` 关闭思考提速
+- **为小模型优化**：工具声明保持精简，≤5B 模型自动用更短的提示词，工具参数 JSON 容错修复，`/think off` 关闭思考提速
 - **会话不丢**：每轮自动保存到 `sessions/`，`/resume` 恢复；输入历史 ↑↓ 可翻，支持多行输入
 - **常驻服务友好**：`npm run dev` 等会自动后台启动并返回访问地址
 
@@ -39,7 +41,7 @@
 coder-agent/
 ├── start.bat              # Windows 一键启动（装依赖 → 运行 chat.py）
 ├── chat.py                # 启动入口（实现在 agent/）
-├── requirements.txt       # rich, prompt_toolkit
+├── requirements.txt       # rich, prompt_toolkit, playwright
 ├── config.example.json    # 配置模板（复制为 config.json）
 ├── config.json            # 运行时配置（含 Key，不上传 Git）
 ├── agent/
@@ -73,6 +75,7 @@ coder-agent/
 | Python | 3.10+，已加入 PATH |
 | 依赖 | `pip install -r requirements.txt`（`start.bat` 会自动装） |
 | GPU（可选） | NVIDIA 驱动；CUDA 包用于 GPU 加速 |
+| 浏览器 | Chrome 或 Edge；供 `check_webpage` 无头运行页面 |
 | 模型 | 至少一个支持 tool calling 的 GGUF |
 
 ## 快速开始
@@ -169,7 +172,7 @@ start.bat
 
 流程：
 
-1. 检查 Python 与依赖（缺 `rich` / `prompt_toolkit` 时自动 `pip install`）
+1. 检查 Python 与依赖（缺 `rich` / `prompt_toolkit` / `playwright` 时自动 `pip install`）
 2. 列出 `models/` 下的 GGUF（大小、参数量、是否带视觉），回车 = 上次用的模型；配了云端时也会列出
 3. 后台拉起 `llama-server`，加载进度实时显示；失败时直接打印日志尾部与原因（显存不足 / 端口占用 / 文件损坏）
 4. 进入对话；退出时自动关闭服务
@@ -248,10 +251,14 @@ copy config.example.json config.json
 
 ### 确认与中断
 
-- 写文件 / 改文件前显示 diff（新文件显示前 20 行），`run_command` 显示命令；↑↓ 选「执行」或「本轮自动」，Esc 拒绝并可填一句原因
+- 写文件 / 改文件前显示 diff（新文件显示前 20 行），`run_command` 显示命令；↑↓ 可选「执行」「本轮自动」或「暂不处理」，Esc 拒绝并可填一句原因
 - 只读命令（`dir` / `git status` 等）与 `process list/read` 自动放行
 - `Ctrl+C`：取消当前任务并断开生成；在提示符下再按一次退出
 - 每轮结束打印统计：`⏱ 12.4s · 38 tok/s · 提示 6.8k / 生成 1.2k · 3 tools · ctx 42%`
+
+`http://127.0.0.1:8080` 的网页也可调用 `read_file`、`write_file`、`edit_file`、
+文件搜索和 shell 命令等 llama-server 内置工具。网页工具没有终端 Agent 的逐次确认，
+只应在本机可信环境使用；相对路径从项目根目录解析。
 
 ### 上下文管理
 
@@ -270,9 +277,10 @@ copy config.example.json config.json
 | `edit_lines` | 按行号 `replace` / `insert` / `delete` |
 | `delete_path` / `move_file` | 删除文件或空目录（可批量）/ 移动重命名 |
 | `list_dir` / `glob_search` / `grep_search` | 目录、按路径模式、正则搜索 |
-| `run_command` | 执行 shell；常驻服务自动后台 |
+| `run_command` | 执行 shell；常驻服务自动后台；运行 npm script 前检查 `package.json` 与脚本是否存在 |
 | `process` | 后台进程 `list` / `read` 日志 / `kill` |
-| `check_syntax` | `.py` / `.json` / `.js` 快速语法检查 |
+| `check_syntax` | `.html` / `.py` / `.json` / `.js` 文件级静态检查；HTML 会检查重复 id/属性、本地资源与内联 JS |
+| `check_webpage` | 无头浏览器运行本地 HTML / URL，捕获控制台、JS、请求与 HTTP 错误 |
 | `todo_write` | 多步骤任务计划清单（返回当前清单） |
 | `web_search` / `fetch_url` | 联网搜索（Tavily）与抓取正文；仅配了 Key 时提供 |
 
@@ -316,6 +324,7 @@ copy config.example.json config.json
 ## 安全提示
 
 - 本工具可读写本地文件并执行任意命令，请只在可信环境使用
+- `check_webpage` 会自动执行页面 JavaScript 并可能发起网络请求，只检查可信的本地页面或 URL
 - 默认对写操作与 `run_command` 做确认；生产或共享机器上慎用 `/auto`
 - 仅监听 `127.0.0.1`，不要随意改成公网暴露
 - `sessions/` 里保存了完整对话（含文件内容），注意不要上传

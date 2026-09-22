@@ -13,9 +13,14 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
+from functools import partial
+from html.parser import HTMLParser
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
@@ -382,17 +387,22 @@ def tool_move_file(src: str, dest: str) -> str:
     return f"OK: moved {s} -> {d}"
 
 def tool_list_dir(path: str | None = None) -> str:
-    """工具实现：列出目录下的文件和子目录。"""
+    """工具实现：列出目录下的文件和子目录，返回可直接复制的完整路径。"""
     p = resolve_path(path or ".")
     if not p.exists():
         return f"ERROR: path not found: {p}"
     if p.is_file():
-        return f"FILE: {p}"
+        return f"[FILE] {p}"
     lines = []
     for child in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-        kind = "dir " if child.is_dir() else "file"
-        lines.append(f"{kind}  {child.name}")
-    return f"{p}\n" + ("\n".join(lines) if lines else "(empty)")
+        kind = "[DIR]" if child.is_dir() else "[FILE]"
+        lines.append(f"{kind} {child}")
+    header = (
+        f"[DIRECTORY] {p}\n"
+        "Each entry below is: [TYPE] FULL_PATH. "
+        "Use only FULL_PATH (after the marker) as a tool path."
+    )
+    return header + "\n" + ("\n".join(lines) if lines else "(empty)")
 
 # ---------- 搜索文件内容 / 按名字找文件 ----------
 
@@ -477,6 +487,57 @@ def prepare_command(command: str) -> str:
     if re.match(r"^npm\s+create\b", cmd, re.I) and "--yes" not in cmd:
         cmd = re.sub(r"^npm\s+create\b", "npm create --yes", cmd, count=1, flags=re.I)
     return cmd
+
+
+def _run_command_context(command: str, cwd: str | None = None) -> tuple[str, Path]:
+    """规范命令与工作目录，并把开头的 cd path && 折叠进 cwd。"""
+    work = resolve_path(cwd) if cwd else Path.cwd()
+    cmd = prepare_command(command)
+    cd_match = re.match(
+        r"^cd\s+(?:/d\s+)?(?P<path>\"[^\"]+\"|'[^']+'|[^\s&]+)\s*&&\s*(?P<rest>.+)$",
+        cmd,
+        re.I,
+    )
+    if cd_match:
+        work = resolve_path(cd_match.group("path").strip("\"'"))
+        cmd = cd_match.group("rest").strip()
+    return cmd, work
+
+
+def preflight_run_command(command: str, cwd: str | None = None) -> str:
+    """执行前拦截无效验收命令，避免弹确认后才发现项目/脚本不存在。"""
+    cmd, work = _run_command_context(command, cwd)
+    if not work.is_dir():
+        return f"ERROR: command cwd does not exist or is not a directory: {work}"
+
+    npm_run = re.match(r"^(npm|pnpm|yarn|bun)\s+run\s+([^\s;&|]+)", cmd, re.I)
+    if npm_run:
+        package_json = work / "package.json"
+        if not package_json.is_file():
+            return (
+                f"SKIPPED: {work} 没有 package.json，不是可运行 npm scripts 的项目。"
+                "不要猜测 lint/test/build 命令；使用已有文件级检查并如实总结验证范围。"
+            )
+        try:
+            package_data = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError) as e:
+            return f"ERROR: cannot read valid package.json before running command: {e}"
+        scripts = package_data.get("scripts") if isinstance(package_data, dict) else None
+        script = npm_run.group(2)
+        if not isinstance(scripts, dict) or script not in scripts:
+            available = ", ".join(scripts.keys()) if isinstance(scripts, dict) and scripts else "(none)"
+            return (
+                f"SKIPPED: package.json 没有脚本 {script!r}；可用 scripts: {available}。"
+                "只能运行项目实际声明的验收脚本。"
+            )
+
+    if re.search(r"\|\|\s*(?:true|exit\s+0)\b|;\s*exit\s+0\b", cmd, re.I):
+        return (
+            "ERROR: validation command masks failures with `|| true` / forced exit 0. "
+            "Remove the failure-suppression suffix and run the real command."
+        )
+    return ""
+
 
 if os.name == "nt":
     import ctypes
@@ -695,10 +756,10 @@ def _proc_kill(pid: int) -> str:
 
 def tool_run_command(command: str, cwd: str | None = None) -> str:
     """工具实现：在 shell 里执行命令；开发服务器会转后台。"""
-    work = resolve_path(cwd) if cwd else Path.cwd()
-    if not work.exists():
-        work.mkdir(parents=True, exist_ok=True)
-    cmd = prepare_command(command)
+    preflight = preflight_run_command(command, cwd)
+    if preflight:
+        return preflight
+    cmd, work = _run_command_context(command, cwd)
     env = os.environ.copy()
     # Prevent hanging on interactive prompts (npx/npm/vite/git…)
     env.update(
@@ -711,14 +772,6 @@ def tool_run_command(command: str, cwd: str | None = None) -> str:
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
-
-    # Strip leading "cd path &&" into cwd when possible
-    cd_match = re.match(r"^cd\s+(?:/d\s+)?(?P<path>\"[^\"]+\"|'[^']+'|[^\s&]+)\s*&&\s*(?P<rest>.+)$", cmd, re.I)
-    if cd_match:
-        work = resolve_path(cd_match.group("path").strip("\"'"))
-        if not work.exists():
-            work.mkdir(parents=True, exist_ok=True)
-        cmd = cd_match.group("rest").strip()
 
     if is_long_running_command(cmd):
         return _run_command_background(cmd, work, env)
@@ -939,9 +992,149 @@ def tool_todo_write(todos: list, merge: bool = True) -> str:
     return "OK:\n" + _format_todos() + note
 
 
+class _HTMLStaticChecker(HTMLParser):
+    """收集无需浏览器即可确认的 HTML/内联脚本问题。"""
+
+    _LOCAL_REFS = {
+        "script": {"src"},
+        "link": {"href"},
+        "img": {"src"},
+        "source": {"src"},
+        "audio": {"src"},
+        "video": {"src", "poster"},
+        "iframe": {"src"},
+    }
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(convert_charrefs=False)
+        self.path = path
+        self.issues: list[str] = []
+        self.ids: dict[str, int] = {}
+        self.scripts: list[tuple[int, bool, str]] = []
+        self._script: tuple[int, bool, list[str]] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        line, _ = self.getpos()
+        names = [name.lower() for name, _ in attrs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            self.issues.append(f"line {line}: duplicate attribute(s): {', '.join(duplicates)}")
+        values = {name.lower(): value or "" for name, value in attrs}
+        element_id = values.get("id", "").strip()
+        if element_id:
+            if element_id in self.ids:
+                self.issues.append(
+                    f"line {line}: duplicate id {element_id!r} (first used at line {self.ids[element_id]})"
+                )
+            else:
+                self.ids[element_id] = line
+        for attr in self._LOCAL_REFS.get(tag, set()):
+            self._check_local_ref(line, values.get(attr, ""))
+        if tag == "script" and not values.get("src"):
+            script_type = values.get("type", "").strip().lower()
+            is_javascript = not script_type or script_type in {
+                "text/javascript", "application/javascript", "module",
+            }
+            if is_javascript:
+                self._script = (line, script_type == "module", [])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._script is not None:
+            line, is_module, chunks = self._script
+            self.scripts.append((line, is_module, "".join(chunks)))
+            self._script = None
+
+    def handle_data(self, data: str) -> None:
+        if self._script is not None:
+            self._script[2].append(data)
+
+    def close(self) -> None:
+        super().close()
+        if self._script is not None:
+            line, is_module, chunks = self._script
+            self.scripts.append((line, is_module, "".join(chunks)))
+            self.issues.append(f"line {line}: unclosed <script> tag")
+            self._script = None
+
+    def _check_local_ref(self, line: int, value: str) -> None:
+        ref = value.strip()
+        if (
+            not ref
+            or ref.startswith(("#", "/", "//", "data:", "javascript:", "{{", "<%"))
+            or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", ref)
+        ):
+            return
+        clean = ref.split("#", 1)[0].split("?", 1)[0]
+        if clean and not (self.path.parent / clean).exists():
+            self.issues.append(f"line {line}: local resource not found: {ref}")
+
+
+def _check_html(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    checker = _HTMLStaticChecker(path)
+    try:
+        checker.feed(text)
+        checker.close()
+    except Exception as e:
+        return f"ERROR: invalid HTML near line {checker.getpos()[0]}: {type(e).__name__}: {e}"
+
+    notes: list[str] = []
+    if checker.scripts:
+        node = shutil.which("node")
+        if node:
+            for line, is_module, script in checker.scripts:
+                if not script.strip():
+                    continue
+                cmd = [node, "--check"]
+                if is_module:
+                    cmd.append("--input-type=module")
+                cmd.append("-")
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=script,
+                        capture_output=True,
+                        text=True,
+                        timeout=20,
+                    )
+                except subprocess.TimeoutExpired:
+                    checker.issues.append(f"line {line}: inline script syntax check timed out")
+                    continue
+                if proc.returncode != 0:
+                    detail = (proc.stderr or proc.stdout).strip().splitlines()
+                    summary = next(
+                        (ln.strip() for ln in detail if "SyntaxError:" in ln),
+                        next((ln.strip() for ln in detail if ln.strip()), "syntax error"),
+                    )
+                    stdin_pos = next(
+                        (re.search(r"\[stdin\]:(\d+)", ln) for ln in detail if "[stdin]:" in ln),
+                        None,
+                    )
+                    html_line = line + int(stdin_pos.group(1)) - 1 if stdin_pos else line
+                    checker.issues.append(f"line {html_line}: inline JavaScript: {summary}")
+        else:
+            notes.append("node 不在 PATH，未检查内联 JavaScript")
+
+    if checker.issues:
+        shown = checker.issues[:20]
+        extra = len(checker.issues) - len(shown)
+        body = "\n".join(f"- {issue}" for issue in shown)
+        if extra > 0:
+            body += f"\n- ...还有 {extra} 个问题"
+        return f"ERROR: HTML static check found {len(checker.issues)} issue(s) in {path}\n{body}"
+
+    suffix = f"；{'；'.join(notes)}" if notes else ""
+    return (
+        f"OK: {path} — HTML static checks passed"
+        f"（结构解析、重复 id/属性、本地资源、内联 JS）{suffix}。"
+        "未执行浏览器运行时、交互或视觉验证；项目存在 build/lint/test 时继续运行对应命令。"
+    )
+
+
 def tool_check_syntax(path: str) -> str:
     """工具实现：对常见语言做一次快速语法自检（不代替真正的构建/测试/lint）。
-    支持 .py / .json / .js(x) / .mjs / .cjs；其它后缀提示改用 run_command。"""
+    支持 .html / .py / .json / .js(x) / .mjs / .cjs；其它后缀提示改用 run_command。"""
     p = resolve_path(path)
     if not p.is_file():
         return f"ERROR: file not found: {p}"
@@ -963,6 +1156,9 @@ def tool_check_syntax(path: str) -> str:
         except json.JSONDecodeError as e:
             return f"ERROR: invalid JSON: {e}"
 
+    if ext in {".html", ".htm"}:
+        return _check_html(p)
+
     if ext in {".js", ".jsx", ".mjs", ".cjs"}:
         if not shutil.which("node"):
             return "ERROR: node not found on PATH, cannot check JS syntax"
@@ -981,9 +1177,173 @@ def tool_check_syntax(path: str) -> str:
 
     return (
         f"ERROR: unsupported extension {ext!r} for check_syntax "
-        "(仅支持 .py/.json/.js/.jsx/.mjs/.cjs)；"
+        "(仅支持 .html/.htm/.py/.json/.js/.jsx/.mjs/.cjs)；"
         "其它语言请用 run_command 跑项目自带的 build/lint/typecheck 命令"
     )
+
+
+class _QuietStaticHandler(SimpleHTTPRequestHandler):
+    """只服务本地页面，不把每个资源请求刷到终端。"""
+
+    def log_message(self, format: str, *args) -> None:
+        pass
+
+
+def _launch_headless_browser(playwright):
+    """优先复用系统 Chrome/Edge，再尝试 Playwright 自带 Chromium。"""
+    failures: list[str] = []
+    for label, kwargs in (
+        ("Chrome", {"channel": "chrome"}),
+        ("Edge", {"channel": "msedge"}),
+        ("Chromium", {}),
+    ):
+        try:
+            return playwright.chromium.launch(headless=True, **kwargs), label
+        except Exception as e:
+            failures.append(f"{label}: {str(e).splitlines()[0]}")
+    raise RuntimeError("no usable browser; " + " | ".join(failures))
+
+
+def _collect_browser_issues(target: str, delay: int, issues: list[str]) -> str:
+    """运行页面并收集错误；确保先关闭浏览器，再停止 Playwright 驱动。"""
+    from playwright.sync_api import sync_playwright
+
+    browser = None
+    browser_label = ""
+
+    def add_issue(kind: str, detail: str) -> None:
+        item = f"{kind}: {detail}".strip()
+        if item not in issues:
+            issues.append(item)
+
+    try:
+        with sync_playwright() as playwright:
+            browser, browser_label = _launch_headless_browser(playwright)
+            try:
+                page = browser.new_page(viewport={"width": 1280, "height": 720})
+
+                def on_console(message) -> None:
+                    if message.type != "error":
+                        return
+                    location = message.location or {}
+                    if str(location.get("url") or "").split("?", 1)[0].endswith("/favicon.ico"):
+                        return
+                    suffix = ""
+                    if location.get("url"):
+                        suffix = f" ({location['url']}:{location.get('lineNumber', 0)})"
+                    add_issue("console.error", message.text + suffix)
+
+                def on_request_failed(request) -> None:
+                    if request.url.split("?", 1)[0].endswith("/favicon.ico"):
+                        return
+                    add_issue(
+                        "request failed",
+                        f"{request.method} {request.url} — {request.failure or 'unknown error'}",
+                    )
+
+                def on_response(response) -> None:
+                    if response.status < 400 or response.url.split("?", 1)[0].endswith("/favicon.ico"):
+                        return
+                    add_issue("HTTP error", f"{response.status} {response.url}")
+
+                def on_page_error(error) -> None:
+                    detail = str(error)
+                    stack = str(getattr(error, "stack", "") or "").strip()
+                    if stack and stack != detail:
+                        detail += "\n" + "\n".join(stack.splitlines()[:5])
+                    add_issue("pageerror", detail)
+
+                page.on("console", on_console)
+                page.on("pageerror", on_page_error)
+                page.on("requestfailed", on_request_failed)
+                page.on("response", on_response)
+                page.goto(target, wait_until="load", timeout=10_000)
+                page.wait_for_timeout(delay)
+            finally:
+                browser.close()
+                browser = None
+    except Exception as e:
+        add = f"{type(e).__name__}: {e}"
+        if len(add) > 1200:
+            add = add[:1200] + "…"
+        add_issue("browser", add)
+    return browser_label
+
+
+def tool_check_webpage(
+    path: str | None = None,
+    url: str | None = None,
+    wait_ms: int | None = None,
+) -> str:
+    """用无头浏览器运行本地 HTML 或 URL，收集控制台、页面与资源错误。"""
+    if bool(path) == bool(url):
+        return "ERROR: pass exactly one of path or url"
+
+    server: ThreadingHTTPServer | None = None
+    target = ""
+    source = ""
+    if path:
+        page_path = resolve_path(path)
+        if not page_path.is_file():
+            return f"ERROR: HTML file not found: {page_path}"
+        if page_path.suffix.lower() not in {".html", ".htm"}:
+            return f"ERROR: check_webpage path must be .html/.htm, got {page_path.suffix!r}"
+        handler = partial(_QuietStaticHandler, directory=str(page_path.parent))
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        except OSError as e:
+            return f"ERROR: cannot start temporary static server: {e}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        target = f"http://127.0.0.1:{port}/{urllib.parse.quote(page_path.name)}"
+        source = str(page_path)
+    else:
+        target = str(url or "").strip()
+        if not target.startswith(("http://", "https://")):
+            return "ERROR: url must start with http:// or https://"
+        source = target
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        if server:
+            server.shutdown()
+            server.server_close()
+        return (
+            "ERROR: Playwright is not installed. Run `python -m pip install -r requirements.txt`, "
+            "then ensure Chrome or Edge is installed."
+        )
+
+    delay = max(250, min(int(wait_ms or 2000), 10_000))
+    issues: list[str] = []
+    show_note("无头浏览器运行中…")
+    try:
+        browser_label = _collect_browser_issues(target, delay, issues)
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+
+    if issues:
+        # 本地临时端口每次随机且已在 finally 关闭；换回源文件路径，避免模型误判端口泄漏。
+        display_issues = [item.replace(target, source) for item in issues]
+        shown = display_issues[:20]
+        body = "\n".join(f"- {item}" for item in shown)
+        if len(display_issues) > len(shown):
+            body += f"\n- ...还有 {len(display_issues) - len(shown)} 个问题"
+        return (
+            f"ERROR: webpage runtime check found {len(display_issues)} issue(s) in {source}"
+            f" [{browser_label or 'browser'}]\n{body}\n"
+            "NOTE: headless browser closed; temporary local server stopped. "
+            "TIME_WAIT sockets after this check are normal and are not running servers."
+        )
+    return (
+        f"OK: {source} — headless browser runtime check passed [{browser_label}, waited {delay}ms]. "
+        "No console.error, uncaught page error, failed request, or HTTP 4xx/5xx was observed. "
+        "Headless browser closed and temporary local server stopped. "
+        "This does not verify visual appearance or every interaction."
+    )
+
 
 # ---------- 联网搜索与抓网页 ----------
 

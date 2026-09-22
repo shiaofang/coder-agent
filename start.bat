@@ -14,9 +14,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import rich, prompt_toolkit" >nul 2>&1
+python -c "import rich, prompt_toolkit, playwright.sync_api" >nul 2>&1
 if errorlevel 1 (
-    echo Installing dependencies: rich, prompt_toolkit ...
+    echo Installing dependencies: rich, prompt_toolkit, playwright ...
     python -m pip install -r "%~dp0requirements.txt"
     if errorlevel 1 (
         echo [ERROR] pip install failed. Run manually: python -m pip install -r requirements.txt

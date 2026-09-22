@@ -286,7 +286,7 @@ MAX_REASONING_ABORTS = 3
 COMPACT_L1_RATIO = 0.75  # 折叠旧工具结果
 COMPACT_L2_RATIO = 0.90  # 模型总结旧对话
 
-# 写操作 / 跑命令前，需要用户在终端确认（读文件等安全操作直接放行）。
+# 写操作 / 跑命令前需要用户确认；普通只读检查（含无头浏览器检查）自动放行。
 # AUTO_APPROVE        — 本轮任务内自动放行（选「自动执行」或下一轮会重置）
 # AUTO_APPROVE_ALWAYS — 全局自动（用户输入 /auto），直到 /manual
 CONFIRM_TOOLS = {
