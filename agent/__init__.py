@@ -3,7 +3,7 @@
 模块分工：
   config          — 配置（config.json）、斜杠命令、安全开关、运行时状态
   server          — 托管本地 llama-server：选模型 / 启动 / 切换 / 读 props
-  prompts         — 系统提示词（full / compact 两档）
+  prompts         — 系统提示词
   project_context — 扫描 cwd 注入项目上下文
   tools_schema    — 给模型看的工具说明书
   tools           — tool_xxx 实现 + execute_tool

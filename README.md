@@ -31,7 +31,7 @@
 - **网页运行检查**：用系统 Chrome / Edge 无头运行 HTML，捕获控制台、JS 与资源加载错误，不弹浏览器窗口
 - **网页工具**：自带 Web UI 已启用 llama-server 全部内置工具，可读写项目文件、搜索内容和执行命令
 - **上下文可见可控**：状态栏实时显示 ctx 用量；快满时自动折叠旧工具结果 / 总结旧对话，`/compact` 手动压缩
-- **为小模型优化**：工具声明保持精简，≤5B 模型自动用更短的提示词，工具参数 JSON 容错修复，`/think off` 关闭思考提速
+- **提示词只留契约**：系统提示写任务模式、路径和验收；工具声明写能力与独有语义；工具参数 JSON 容错修复，`/think off` 可关思考提速
 - **会话不丢**：每轮自动保存到 `sessions/`，`/resume` 恢复；输入历史 ↑↓ 可翻，支持多行输入
 - **常驻服务友好**：`npm run dev` 等会自动后台启动并返回访问地址
 
@@ -47,7 +47,7 @@ coder-agent/
 ├── agent/
 │   ├── config.py          # 读取 config.json、斜杠命令、安全开关、运行时状态
 │   ├── server.py          # 选模型、启动/切换 llama-server、读 /props
-│   ├── prompts.py         # 系统提示词（full / compact 两档）
+│   ├── prompts.py         # 系统提示词
 │   ├── project_context.py # 扫描 cwd 注入项目上下文
 │   ├── tools_schema.py    # 给模型看的工具说明书
 │   ├── tools.py           # tool_xxx 实现 + 调度
@@ -60,6 +60,7 @@ coder-agent/
 │   ├── loop.py            # 多轮工具循环
 │   └── main.py            # 主程序入口
 ├── bin/                   # 本地自备：llama-server 及 DLL（不上传 Git）
+├── bin-prism/             # 可选：PrismML 分支的 llama-server（三值量化模型用）
 ├── models/                # 本地自备：*.gguf 模型（不上传 Git）
 ├── sessions/              # 自动保存的会话（不上传 Git）
 └── README.md
@@ -164,6 +165,47 @@ models/Qwen3.5-9B-Q4_K_M.mmproj.gguf
 
 名字不匹配时启动会问你要不要启用（默认不启用；projector 只能配它自己那个模型）。
 
+#### 三值量化模型（Bonsai，可选）
+
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+这类权重（文件名带 `PTQ1_0` / `PQ2_0`）用的是自定义三值量化，**官方 llama.cpp 加载会直接报
+`invalid ggml type 143` 退出**，必须用 PrismML 分支编出的 `llama-server`。
+
+本项目支持两套运行时并存：把 PrismML 分支的 `llama-server` 及其 DLL 放进 `bin-prism/`，
+选到这类模型时自动切过去，其余模型继续用 `bin/`。目录放别处时在 `config.json` 里写
+`server.prism_bin_dir`。缺这份构建时，模型列表会标注「缺 Prism 运行时」并在启动前直接报错，
+不会白等一次加载。
+
+拿二进制的两种方式（[releases](https://github.com/PrismML-Eng/llama.cpp/releases/latest)）：
+
+- **下预编译包**：按 `bin/` 同样的规则挑，N 卡选 `llama-prism-*-bin-win-cuda-12.4-x64.zip`
+  并额外下同版本 `cudart-llama-bin-win-cuda-12.4-x64.zip`，两个包的内容一起解压进 `bin-prism/` 根目录
+- **自己编**：`git clone -b prism https://github.com/PrismML-Eng/llama.cpp` 后
+  `cmake -B build -DGGML_CUDA=ON && cmake --build build -j`，把 `build/bin/` 的产物拷进 `bin-prism/`
+
+分支的基线 commit 和官方版不一定一致，启动前会先读一次 `llama-server --help`，
+只传它认识的参数（`--jinja` / `--tools` / `-fitt`），缺哪个就自动退回 `-ngl 99 -c <fit_ctx>`。
+
+选到这类模型时会自动套一套 6 GB 卡实测参数，**`config.json` 里显式写过的键不会被覆盖**：
+
+| 预设 | 为什么 |
+|------|--------|
+| `-ngl 99` | 权重 5.95 GB 必须整体在 GPU 上。交给 `--fit` 自适应会把层挤回 CPU，实测从 3.9 tok/s 掉到 0.4 以下 |
+| `-nkvo` + `-ctk q4_0` `-ctv q4_0` | 显存已被权重占满，KV cache 放内存并压到 q4_0，否则上下文一大就 OOM |
+| `-fa on`、`--context-shift` | Flash Attention 省 KV 显存；上下文满了滚动而不是报错 |
+| `temp 1.0` / `top_p 0.95` / `top_k 20` / `repeat_penalty 1.1` | Bonsai（Qwen3 系）官方推荐采样值 |
+| `ctx 65536` | 只在 `config.json` 没写 `server.ctx` 时生效 |
+
+RTX 2060 6GB 上的实测：加载约 10 秒，生成约 4 tok/s。能用但慢，适合让它慢慢改一个文件，
+不适合长对话来回。
+
+#### 思考深度
+
+选模型的表格里有「思考深度」一列。程序会读 GGUF 里的 chat template 判断该模型是否支持
+`reasoning_effort`：支持就列出可选档位（如 Bonsai 的 低/中/极高），选完模型再问一次深度，
+按 `--reasoning-effort` 传给服务；只有思考开关（`enable_thinking`）没有分档的模型显示 `-`，
+不会追问。档位白名单直接从模板里解析，不会传模型不认的值。回车 = 用模型模板自带的默认档。
+
 ### 3. 启动
 
 ```bat
@@ -195,8 +237,7 @@ copy config.example.json config.json
   "api_key": "",
   "tavily_api_key": "",
   "server":   { "fit_margin": 384, "fit_ctx": 16384, "ngl": null, "ctx": null, "extra_args": [] },
-  "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat_penalty": null },
-  "prompt_tier": "auto"
+  "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat_penalty": null }
 }
 ```
 
@@ -210,8 +251,8 @@ copy config.example.json config.json
 | `server.fit_ctx` | 自适应允许的最小上下文（`-fitc`）。系统提示 + 工具声明约 2k token，别低于 8192 |
 | `server.ngl` / `server.ctx` | 手动写死 `-ngl` / `-c`（写了就不再自适应）；环境变量 `CODER_AGENT_NGL` / `CODER_AGENT_CTX` 优先 |
 | `server.extra_args` | 追加给 llama-server 的其它参数 |
+| `server.prism_bin_dir` | 三值量化（`PTQ1_0`/`PQ2_0`）模型用的 PrismML `llama-server` 目录，留空 = `bin-prism/` |
 | `sampling.*` | 采样参数，非空字段才发给模型。示例值是 Qwen3 系列推荐 |
-| `prompt_tier` | `auto`（≤5B 用 compact 提示词）/ `full` / `compact` |
 
 6GB RTX 2060 + 9B Q4_K_M 实测 `fit_margin`：`1024` → 4.3 GB / 9 tok/s；`384` → 5.0 GB / 14 tok/s；`128` → 5.3 GB / 17 tok/s。
 
@@ -304,6 +345,7 @@ copy config.example.json config.json
 |------|-------------|
 | 双击 `start.bat` 窗口一闪而过，什么都没有 | 多半是 Python 没装或没加进 PATH。在命令行 `python --version` 确认；也可以在窗口里手动 `python chat.py` 看报错 |
 | 提示找不到 `xxx.dll` / `llama-server` 闪退 | `bin/` 的 DLL 没拷全。重看 [1.3](#13-放好后-bin-里应该有什么)，CUDA 版记得连 `cudart-*` 包一起解压 |
+| 模型加载失败，日志里有 `invalid ggml type` | 该量化档这份 `llama-server` 不认识。三值量化模型要用 `bin-prism/` 里的 PrismML 构建；其它情况多半是 `bin/` 版本过旧，重下新版 |
 | 模型加载失败，日志里有 `out of memory` | 显存不够。调小 `config.json` 的 `server.fit_ctx`（如 `8192`），或调大 `server.fit_margin` |
 | 起来了但很慢（个位数 tok/s） | GPU 放不下、层落到了 CPU。换更小的量化档（Q4）、调小上下文，或用参数量更小的模型 |
 | `HTTP 401 Unauthorized`（云端） | `config.json` 的 `api_key` 无效或过期，去对应平台重新生成 |

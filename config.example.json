@@ -14,7 +14,8 @@
     "fit_ctx": 16384,
     "ngl": null,
     "ctx": null,
-    "extra_args": []
+    "extra_args": [],
+    "prism_bin_dir": ""
   },
 
   "sampling": {
@@ -23,7 +24,5 @@
     "top_k": 20,
     "min_p": 0.0,
     "repeat_penalty": null
-  },
-
-  "prompt_tier": "auto"
+  }
 }

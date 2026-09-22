@@ -23,6 +23,20 @@ from agent import config
 from agent.render import console, error, info, warn
 
 _PARAMS_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])")
+# Bonsai 系列的三值/二值量化标记；官方 llama.cpp 读到这些张量会报 invalid ggml type
+_TERNARY_QUANT_RE = re.compile(r"(?:^|[-_.])(PTQ1_0|PQ2_0)(?:[-_.]|$)", re.I)
+_MODEL_CARD_URL = "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf"
+
+# 三值 Bonsai 在 6GB 卡（RTX 2060）上实测可用的一套参数。
+# 权重本身就有 5.95GB，几乎占满显存，所以：层全部上 GPU（--fit 会把层挤回 CPU 变很慢），
+# KV cache 留在内存（-nkvo）并压成 q4_0，否则上下文一大就 OOM。
+# 采样值用 Bonsai/Qwen3 官方推荐；config.json 里显式写过的键不会被这里覆盖。
+_PRISM_PROFILE: dict = {
+    "ngl": 99,
+    "ctx": 65536,
+    "flags": [["-fa", "on"], ["-nkvo"], ["-ctk", "q4_0"], ["-ctv", "q4_0"], ["--context-shift"]],
+    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "repeat_penalty": 1.1},
+}
 _LOG_TAIL = 60
 _HEALTH_TIMEOUT_S = 600  # 大模型 / 慢盘加载可能很久
 
@@ -40,6 +54,96 @@ _PROGRESS_PATTERNS = (
 _ERROR_RE = re.compile(r"error|failed|out of memory|cannot|unable", re.I)
 
 
+# 思考深度英文档位 → 中文显示
+_EFFORT_LABELS = {
+    "minimal": "最低", "low": "低", "medium": "中",
+    "high": "高", "xhigh": "极高", "default": "默认",
+}
+
+
+def _read_chat_template(path: Path) -> str:
+    """只读 GGUF 头部的 KV 元数据，取出 tokenizer.chat_template（不加载张量）。"""
+    import struct
+    fixed = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return ""
+            f.read(4)  # version
+            struct.unpack("<Q", f.read(8))  # tensor count
+            n_kv = struct.unpack("<Q", f.read(8))[0]
+
+            def rd_str_bytes() -> bytes:
+                ln = struct.unpack("<Q", f.read(8))[0]
+                return f.read(ln)
+
+            def skip_value(t: int) -> None:
+                if t == 8:  # string
+                    ln = struct.unpack("<Q", f.read(8))[0]
+                    f.seek(ln, 1)
+                elif t == 9:  # array
+                    et = struct.unpack("<I", f.read(4))[0]
+                    cnt = struct.unpack("<Q", f.read(8))[0]
+                    if et == 8:
+                        for _ in range(cnt):
+                            ln = struct.unpack("<Q", f.read(8))[0]
+                            f.seek(ln, 1)
+                    else:
+                        f.seek(fixed.get(et, 0) * cnt, 1)
+                else:
+                    f.seek(fixed.get(t, 0), 1)
+
+            for _ in range(n_kv):
+                key = rd_str_bytes().decode("utf-8", "replace")
+                vtype = struct.unpack("<I", f.read(4))[0]
+                if key == "tokenizer.chat_template" and vtype == 8:
+                    ln = struct.unpack("<Q", f.read(8))[0]
+                    return f.read(ln).decode("utf-8", "replace")
+                skip_value(vtype)
+    except Exception:
+        return ""
+    return ""
+
+
+def _parse_reasoning_levels(template: str) -> list[str]:
+    """从 chat template 里解析支持的思考深度档位（按 low→high 排序）。
+
+    只有模板显式用了 reasoning_effort 才算「可调深度」；Qwen3 那种只有
+    enable_thinking 开关的不算。允许的字面量从模板里的白名单 (`not in (...)`)
+    提取，避免传模型不认识的值触发模板异常。
+    """
+    if "reasoning_effort" not in template:
+        return []
+    order = ["minimal", "low", "medium", "high", "xhigh"]
+    found: set[str] = set()
+    for m in re.finditer(r"reasoning_effort[^\n]*?in\s*\(([^)]*)\)", template):
+        for lit in re.findall(r"['\"]([a-zA-Z]+)['\"]", m.group(1)):
+            if lit in order:
+                found.add(lit)
+    if not found:
+        # 用了 reasoning_effort 但没写白名单：给一组通用档位
+        found = {"low", "medium", "high"}
+    return [x for x in order if x in found]
+
+
+_tmpl_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def reasoning_levels(path: Path) -> list[str]:
+    """带缓存地取某模型支持的思考深度档位（按文件 mtime 失效）。"""
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return []
+    hit = _tmpl_cache.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    levels = _parse_reasoning_levels(_read_chat_template(path))
+    _tmpl_cache[key] = (mtime, levels)
+    return levels
+
+
 @dataclass
 class ModelInfo:
     path: Path
@@ -50,6 +154,15 @@ class ModelInfo:
     @property
     def name(self) -> str:
         return self.path.name
+
+    @property
+    def needs_prism_runtime(self) -> bool:
+        """三值量化权重只有 PrismML 分支的 llama-server 能加载。"""
+        return bool(_TERNARY_QUANT_RE.search(self.path.stem))
+
+    @property
+    def reasoning_levels(self) -> list[str]:
+        return reasoning_levels(self.path)
 
 
 class _Proc:
@@ -130,17 +243,25 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
     table.add_column("大小", justify="right", style="dim")
     table.add_column("参数", justify="right", style="dim")
     table.add_column("视觉", style="dim")
+    table.add_column("思考深度", style="dim")
+    missing_prism = False
     for i, m in enumerate(models, 1):
         mark = ""
         if m.name == last:
             default_idx = i
             mark = " [dim](上次)[/]"
+        if m.needs_prism_runtime and resolve_exe(m) is None:
+            missing_prism = True
+            mark += " [yellow](缺 Prism 运行时)[/]"
+        levels = m.reasoning_levels
+        depth = "/".join(_EFFORT_LABELS.get(x, x) for x in levels) if levels else "-"
         table.add_row(
             str(i),
             m.name + mark,
             f"{m.size_gb:.1f} GB",
             f"{m.params_b:g}B" if m.params_b else "-",
             "mmproj" if m.mmproj else "",
+            depth,
         )
     extra_idx = len(models)
     cloud_idx = attach_idx = 0
@@ -151,15 +272,18 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
         # 上次用的是云端，或没有记录但 config.json 写的是 provider=cloud → 默认选云端
         if last == "cloud" or (not last and config.PROVIDER == "cloud"):
             default_idx = cloud_idx
-        table.add_row(str(cloud_idx), f"☁ 云端 {config.MODEL_NAME}{mark}", "", "", "")
+        table.add_row(str(cloud_idx), f"☁ 云端 {config.MODEL_NAME}{mark}", "", "", "", "")
     if allow_attach:
         extra_idx += 1
         attach_idx = extra_idx
-        table.add_row(str(attach_idx), f"↪ 使用已在运行的 llama-server ({config.HOST}:{config.PORT})", "", "", "")
+        table.add_row(str(attach_idx), f"↪ 使用已在运行的 llama-server ({config.HOST}:{config.PORT})", "", "", "", "")
 
     console.print()
     console.print("[bold]选择模型[/]")
     console.print(table)
+    if missing_prism:
+        console.print(f"  [dim]三值量化（PTQ1_0/PQ2_0）需把 PrismML 分支的 llama-server 放进 "
+                      f"{config.PRISM_BIN_DIR.name}\\ ，官方 bin\\ 加载不了[/]")
     while True:
         try:
             raw = console.input(f"[dim]输入序号 [1-{extra_idx}]，回车 = {default_idx}: [/]").strip()
@@ -183,7 +307,32 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
             return "attach"
         m = models[choice - 1]
         _write_last_model(m.name)
+        config.REASONING_EFFORT = _pick_reasoning_effort(m)
         return m
+
+
+def _pick_reasoning_effort(model: ModelInfo) -> str:
+    """模型模板支持思考深度时追问一次；返回英文档位，空串 = 用模型默认。"""
+    levels = model.reasoning_levels
+    if not levels:
+        return ""
+    lines = []
+    for i, lv in enumerate(levels, 1):
+        cn = _EFFORT_LABELS.get(lv, lv)
+        lines.append(f"    {i} {cn} ({lv})")
+    console.print(f"  [dim]该模型支持思考深度：[/]")
+    console.print("\n".join(f"  [dim]{ln}[/]" for ln in lines))
+    while True:
+        try:
+            raw = console.input(f"  [dim]选择 [1-{len(levels)}]，回车 = 用模型默认: [/]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return ""
+        if not raw:
+            return ""
+        if raw.isdigit() and 1 <= int(raw) <= len(levels):
+            return levels[int(raw) - 1]
+        warn(f"输入 1-{len(levels)} 或直接回车")
 
 
 # ------------------------------------------------------------------------
@@ -228,6 +377,44 @@ def apply_props() -> dict:
 #  启动 / 停止
 # ------------------------------------------------------------------------
 
+def _exe_in(dir_path: Path) -> Path:
+    return dir_path / ("llama-server.exe" if os.name == "nt" else "llama-server")
+
+
+def resolve_exe(model: ModelInfo) -> Path | None:
+    """挑选该模型该用哪个 llama-server：三值量化优先用 bin-prism\\，其余用 bin\\。"""
+    if model.needs_prism_runtime:
+        prism = _exe_in(config.PRISM_BIN_DIR)
+        if prism.is_file():
+            return prism
+        return None
+    exe = _exe_in(config.BIN_DIR)
+    return exe if exe.is_file() else None
+
+
+_help_cache: dict[str, str] = {}
+
+
+def _help_text(exe: Path) -> str:
+    """缓存 `llama-server --help`，用来判断这份二进制支持哪些参数。
+
+    不同分支（官方 / PrismML）基线 commit 不同，直接传不认识的参数会让服务启动即退出。
+    """
+    key = str(exe)
+    if key not in _help_cache:
+        try:
+            r = subprocess.run([key, "--help"], capture_output=True, timeout=30)
+            _help_cache[key] = (r.stdout + r.stderr).decode("utf-8", errors="replace")
+        except Exception:
+            _help_cache[key] = ""  # 探测失败：按「都支持」处理，交给日志报错
+    return _help_cache[key]
+
+
+def _supports(exe: Path, flag: str) -> bool:
+    help_text = _help_text(exe)
+    return not help_text or flag in help_text
+
+
 def _kill_stale() -> None:
     """结束残留的 llama-server（比如上次异常退出没关掉）。"""
     if os.name == "nt":
@@ -236,28 +423,73 @@ def _kill_stale() -> None:
         subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
 
 
-def _build_cmd(model: ModelInfo, mmproj: Path | None) -> list[str]:
-    exe = config.BIN_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server")
-    srv = config.SERVER
+def _profile_for(model: ModelInfo) -> dict | None:
+    return _PRISM_PROFILE if model.needs_prism_runtime else None
+
+
+def _effective_server(model: ModelInfo) -> dict:
+    """本次启动实际用的 server 参数：config.json 为准，预设只补没写过的键。"""
+    srv = dict(config.SERVER)
+    prof = _profile_for(model)
+    if prof:
+        for key in ("ngl", "ctx"):
+            if key not in config.SERVER_EXPLICIT:
+                srv[key] = prof[key]
+    return srv
+
+
+def _apply_sampling_profile(model: ModelInfo) -> list[str]:
+    """把预设采样值写进 config.SAMPLING（切模型时先还原成 config.json 的值）。"""
+    config.SAMPLING.update(config.SAMPLING_BASE)
+    prof = _profile_for(model)
+    if not prof:
+        return []
+    applied = []
+    for key, val in prof["sampling"].items():
+        if key not in config.SAMPLING_EXPLICIT:
+            config.SAMPLING[key] = val
+            applied.append(f"{key}={val:g}")
+    return applied
+
+
+def _build_cmd(model: ModelInfo, mmproj: Path | None, exe: Path, srv: dict) -> list[str]:
     cmd = [
         str(exe),
         "-m", str(model.path),
         "--host", config.HOST,
         "--port", str(config.PORT),
         "-np", "1",
-        "--jinja",
-        "--tools", "all",
     ]
+    if _supports(exe, "--jinja"):
+        cmd += ["--jinja"]
+    if _supports(exe, "--tools "):
+        cmd += ["--tools", "all"]  # 网页界面自带的内置工具，终端 agent 不依赖它
+    if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
+        cmd += ["--reasoning-effort", config.REASONING_EFFORT]
     # 没写死 -ngl/-c 时交给 --fit 按空闲显存自适应
     if srv.get("ngl") is not None:
         cmd += ["-ngl", str(srv["ngl"])]
     if srv.get("ctx") is not None:
         cmd += ["-c", str(srv["ctx"])]
     if srv.get("ngl") is None or srv.get("ctx") is None:
-        cmd += ["-fitt", str(srv["fit_margin"]), "-fitc", str(srv["fit_ctx"])]
+        if _supports(exe, "-fitt"):
+            cmd += ["-fitt", str(srv["fit_margin"]), "-fitc", str(srv["fit_ctx"])]
+        else:
+            # 旧基线没有 --fit：尽量全放显存 + 固定上下文，不够时由用户配 ngl/ctx
+            if srv.get("ngl") is None:
+                cmd += ["-ngl", "99"]
+            if srv.get("ctx") is None:
+                cmd += ["-c", str(srv["fit_ctx"])]
     if mmproj:
         cmd += ["--mmproj", str(mmproj)]
-    cmd += list(srv.get("extra_args") or [])
+    extra = list(srv.get("extra_args") or [])
+    prof = _profile_for(model)
+    if prof:
+        # 自己在 extra_args 里写过同名参数时以用户的为准
+        for group in prof["flags"]:
+            if group[0] not in extra and _supports(exe, group[0]):
+                cmd += group
+    cmd += extra
     return cmd
 
 
@@ -294,15 +526,25 @@ def _resolve_mmproj(model: ModelInfo) -> Path | None:
 
 def start(model: ModelInfo) -> bool:
     """启动 llama-server 并等待 /health 就绪。失败时把日志尾部打出来。"""
-    exe = config.BIN_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server")
-    if not exe.is_file():
-        error(f"找不到 {exe}")
+    exe = resolve_exe(model)
+    if exe is None:
+        if model.needs_prism_runtime:
+            error(f"{model.name} 是三值量化权重，官方 llama.cpp 加载会报 invalid ggml type")
+            console.print(
+                f"  [dim]请把 PrismML 分支编出的 llama-server（含同目录 dll）放到 "
+                f"{config.PRISM_BIN_DIR}\\ ，或在 config.json 里设 server.prism_bin_dir 指向它[/]"
+            )
+            console.print(f"  [dim]构建/下载说明见模型卡片：[/][blue underline]{_MODEL_CARD_URL}[/]")
+        else:
+            error(f"找不到 {_exe_in(config.BIN_DIR)}")
         return False
 
     stop()
     _kill_stale()
     mmproj = _resolve_mmproj(model)
-    cmd = _build_cmd(model, mmproj)
+    srv = _effective_server(model)
+    samp = _apply_sampling_profile(model)
+    cmd = _build_cmd(model, mmproj, exe, srv)
 
     creationflags = 0
     if os.name == "nt":
@@ -329,9 +571,16 @@ def start(model: ModelInfo) -> bool:
     holder: dict = {"line": ""}
     threading.Thread(target=_reader, args=(proc.stdout, holder), daemon=True).start()
 
-    tune = "自适应显存" if config.SERVER.get("ngl") is None and config.SERVER.get("ctx") is None else \
-        f"ngl={config.SERVER.get('ngl')} ctx={config.SERVER.get('ctx')}"
-    console.print(f"[dim]启动 llama-server：{model.name}  ({tune}{', 视觉 on' if mmproj else ''})[/]")
+    tune = "自适应显存" if srv.get("ngl") is None and srv.get("ctx") is None else \
+        f"ngl={srv.get('ngl')} ctx={srv.get('ctx')}"
+    runtime = f", 运行时 {exe.parent.name}\\" if exe.parent != config.BIN_DIR else ""
+    console.print(f"[dim]启动 llama-server：{model.name}  ({tune}{runtime}{', 视觉 on' if mmproj else ''})[/]")
+    if _profile_for(model):
+        detail = "KV 留内存 + q4_0" + (f"，采样 {' '.join(samp)}" if samp else "")
+        console.print(f"  [dim]已套用三值模型预设：{detail}（config.json 里写过的值不会被覆盖）[/]")
+    if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
+        cn = _EFFORT_LABELS.get(config.REASONING_EFFORT, config.REASONING_EFFORT)
+        console.print(f"  [dim]思考深度：{cn}（--reasoning-effort {config.REASONING_EFFORT}）[/]")
 
     deadline = time.time() + _HEALTH_TIMEOUT_S
     with console.status("[dim]加载模型…[/]", spinner="dots") as status:
@@ -372,7 +621,12 @@ def _print_log_tail(n: int = 25) -> None:
 
 def _print_hints() -> None:
     text = "\n".join(_state.log).lower()
-    if "out of memory" in text or "cuda" in text and "failed" in text:
+    if "invalid ggml type" in text:
+        warn("这份 llama-server 不认识该量化类型：三值量化（PTQ1_0/PQ2_0）需要 PrismML 分支的构建")
+        console.print(f"  [dim]把它放到 {config.PRISM_BIN_DIR}\\ ；说明见 {_MODEL_CARD_URL}[/]")
+    elif "invalid argument" in text or "unknown argument" in text or "error while handling argument" in text:
+        warn("启动参数不被这份 llama-server 支持：检查 config.json 的 server.extra_args")
+    elif "out of memory" in text or "cuda" in text and "failed" in text:
         warn("显存不足：把 config.json 里 server.fit_ctx 调小（如 8192），或调大 fit_margin")
     elif "failed to load model" in text or "invalid" in text:
         warn("模型文件损坏或 llama-server 版本过旧，无法识别该 GGUF")

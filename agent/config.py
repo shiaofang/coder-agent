@@ -14,6 +14,9 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BIN_DIR = ROOT_DIR / "bin"
+# 三值量化（Bonsai 的 PTQ1_0 / PQ2_0）官方 llama.cpp 认不出来，
+# 需要把 PrismML 分支编出来的 llama-server 放这里；只在选到这类模型时才用。
+PRISM_BIN_DIR = ROOT_DIR / "bin-prism"
 MODEL_DIR = ROOT_DIR / "models"
 SESSION_DIR = ROOT_DIR / "sessions"
 HISTORY_FILE = ROOT_DIR / ".history"
@@ -50,6 +53,10 @@ SERVER: dict = {
     "ctx": None,
     "extra_args": [],
 }
+# config.json / 环境变量里显式写过的键。模型预设（如三值 Bonsai）只填没写过的，
+# 不覆盖用户的选择。
+SERVER_EXPLICIT: set[str] = set()
+SAMPLING_EXPLICIT: set[str] = set()
 
 # 采样参数（config.json -> "sampling"），非 None 的字段才会放进请求体
 SAMPLING: dict = {
@@ -59,9 +66,6 @@ SAMPLING: dict = {
     "min_p": None,
     "repeat_penalty": None,
 }
-
-# 提示词分级："auto"（≤5B 用 compact）/ "full" / "compact"
-PROMPT_TIER = "auto"
 
 CONFIG_PATH = ROOT_DIR / "config.json"
 # 旧文件名：若只有 cloud_config.json，加载时提示迁移
@@ -77,7 +81,7 @@ def _load_config() -> None:
       ngl/ctx  — 环境变量 CODER_AGENT_NGL / CODER_AGENT_CTX > config.json server.*
     """
     global HOST, PORT, BASE, PROVIDER, PROVIDER_FROM_ENV, CLOUD_BASE, MODEL_NAME, API_KEY
-    global TAVILY_API_KEY, CONFIG_ERROR, PROMPT_TIER
+    global TAVILY_API_KEY, CONFIG_ERROR, PRISM_BIN_DIR
 
     data: dict = {}
     path = CONFIG_PATH
@@ -130,14 +134,20 @@ def _load_config() -> None:
                 except (TypeError, ValueError):
                     CONFIG_ERROR = f"config.json 的 server.{key} 必须是整数"
                     return
+                SERVER_EXPLICIT.add(key)
         extra = srv.get("extra_args")
         if isinstance(extra, list):
             SERVER["extra_args"] = [str(x) for x in extra]
+        prism_dir = str(srv.get("prism_bin_dir", "")).strip()
+        if prism_dir:
+            p = Path(prism_dir)
+            PRISM_BIN_DIR = p if p.is_absolute() else (ROOT_DIR / p)
     for env_key, cfg_key in (("CODER_AGENT_NGL", "ngl"), ("CODER_AGENT_CTX", "ctx")):
         val = os.environ.get(env_key, "").strip()
         if val:
             try:
                 SERVER[cfg_key] = int(val)
+                SERVER_EXPLICIT.add(cfg_key)
             except ValueError:
                 pass
 
@@ -151,10 +161,7 @@ def _load_config() -> None:
                 except (TypeError, ValueError):
                     CONFIG_ERROR = f"config.json 的 sampling.{key} 必须是数字"
                     return
-
-    tier = str(data.get("prompt_tier", "")).strip().lower()
-    if tier in {"auto", "full", "compact"}:
-        PROMPT_TIER = tier
+                SAMPLING_EXPLICIT.add(key)
 
     # —— provider：环境变量 > config.json > local ——
     env_provider = os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower()
@@ -187,6 +194,9 @@ def _load_config() -> None:
 
 _load_config()
 
+# 模型预设改过 SAMPLING 后，切回别的模型要能还原成 config.json 里的值
+SAMPLING_BASE: dict = dict(SAMPLING)
+
 
 def cloud_available() -> bool:
     """config.json 里是否配好了可用的云端模型。"""
@@ -215,19 +225,13 @@ MODEL_LABEL = ""  # 横幅/状态栏显示用
 MODEL_PARAMS_B: float | None = None  # 从文件名解析的参数量（B）
 MODEL_N_CTX = 0  # 服务端实际上下文长度；0 = 未知
 DEFAULT_CLOUD_CTX = 128_000
+# 本地模型的思考深度（--reasoning-effort），如 "low"/"medium"/"xhigh"；
+# 空串 = 不传，用模型模板自带的默认档。选模型时按模板支持情况询问后写入。
+REASONING_EFFORT = ""
 
 # 会话开关
 THINKING = True  # /think on|off → chat_template_kwargs.enable_thinking
 VERBOSE = False  # /verbose → 工具结果 / 思考全量显示
-
-
-def prompt_tier() -> str:
-    """当前应使用的提示词档位（full / compact）。"""
-    if PROMPT_TIER in {"full", "compact"}:
-        return PROMPT_TIER
-    if MODEL_PARAMS_B is not None and MODEL_PARAMS_B <= 5:
-        return "compact"
-    return "full"
 
 
 def n_ctx() -> int:
@@ -274,7 +278,7 @@ SLASH_MENU: list[tuple[str, str]] = [
 # 安全与性能上限：
 #   MAX_TOOL_ROUNDS     — 一轮用户任务里，最多允许「模型调工具」多少次，防止死循环
 #   MAX_READ_CHARS      — 读文件返回给模型的最大字符数，避免上下文爆掉
-#   MAX_REASONING_*     — 小模型「思考」阶段有时会重复啰嗦，用来检测并打断
+#   MAX_REASONING_*     — 思考阶段若重复啰嗦，用来检测并打断
 MAX_TOOL_ROUNDS = 48
 MAX_READ_CHARS = 80_000
 MAX_REASONING_CHARS = 6000
