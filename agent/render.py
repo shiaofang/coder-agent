@@ -460,7 +460,9 @@ def show_banner(cwd: str) -> None:
     lines.append("本地终端编程助手，直接读文件、改代码、跑命令\n\n", style="dim")
     lines.append("模型  ", style="dim")
     lines.append(f"{model}", style="cyan")
-    if config.PROVIDER == "cloud":
+    if config.API_STYLE == "deepseek":
+        lines.append("  (deepseek)", style="dim")
+    elif config.PROVIDER == "cloud":
         lines.append("  (云端)", style="dim")
     else:
         lines.append(f"  ctx {_fmt_k(n_ctx)}", style="dim")

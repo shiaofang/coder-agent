@@ -29,15 +29,23 @@ HOST = "127.0.0.1"
 PORT = 8080
 BASE = f"http://{HOST}:{PORT}"
 
-# PROVIDER    — "local"（本机 llama-server）或 "cloud"（OpenAI 兼容接口）
-# MODEL_NAME  — 云端请求体里的 model；本地可留空
-# API_KEY     — 云端鉴权；本地可留空
+# PROVIDER    — "local"（本机 llama-server）或 "cloud"（云端；含 OpenAI 兼容和 deepseek）
+# API_STYLE   — "openai"（/v1/chat/completions）或 "deepseek"（网页 /api/v0/chat/completion）
+# MODEL_NAME  — OpenAI 兼容云端请求体里的 model；本地可留空
+# API_KEY     — OpenAI 兼容云端鉴权；本地可留空
+# DEEPSEEK_*  — 菜单里的 deepseek，和上面的云端配置互不影响
 # CONFIG_ERROR — 配置缺失/不完整时的错误说明，main.py 启动时检查并退出
 PROVIDER = "local"
+API_STYLE = "openai"
 PROVIDER_FROM_ENV = False  # 环境变量显式指定了 provider 时不再弹「本地/云端」菜单
 CLOUD_BASE = ""  # config.json 里的 base_url（供菜单里切到云端时使用）
 MODEL_NAME = ""
 API_KEY = ""
+DEEPSEEK_BASE = ""
+DEEPSEEK_API_KEY = ""
+DEEPSEEK_COOKIE = ""
+DEEPSEEK_DEVICE_ID = ""
+DEEPSEEK_SEARCH = False
 TAVILY_API_KEY = ""
 CONFIG_ERROR: str | None = None
 
@@ -80,7 +88,8 @@ def _load_config() -> None:
       搜索 Key — 环境变量 TAVILY_API_KEY > config.json tavily_api_key
       ngl/ctx  — 环境变量 CODER_AGENT_NGL / CODER_AGENT_CTX > config.json server.*
     """
-    global HOST, PORT, BASE, PROVIDER, PROVIDER_FROM_ENV, CLOUD_BASE, MODEL_NAME, API_KEY
+    global HOST, PORT, BASE, PROVIDER, API_STYLE, PROVIDER_FROM_ENV, CLOUD_BASE, MODEL_NAME, API_KEY
+    global DEEPSEEK_BASE, DEEPSEEK_API_KEY, DEEPSEEK_COOKIE, DEEPSEEK_DEVICE_ID, DEEPSEEK_SEARCH
     global TAVILY_API_KEY, CONFIG_ERROR, PRISM_BIN_DIR
 
     data: dict = {}
@@ -117,6 +126,19 @@ def _load_config() -> None:
     CLOUD_BASE = str(data.get("base_url", "")).strip().rstrip("/")
     MODEL_NAME = str(data.get("model", "")).strip()
     API_KEY = str(data.get("api_key", "")).strip()
+
+    # —— deepseek 网页协议，和上面的 OpenAI 兼容云端分开 ——
+    ds = data.get("deepseek")
+    if isinstance(ds, dict):
+        DEEPSEEK_BASE = str(ds.get("base_url", "")).strip().rstrip("/")
+        suffix = "/api/v0/chat/completion"
+        if DEEPSEEK_BASE.endswith(suffix):
+            DEEPSEEK_BASE = DEEPSEEK_BASE[: -len(suffix)].rstrip("/")
+        DEEPSEEK_API_KEY = str(ds.get("api_key", "")).strip()
+        DEEPSEEK_COOKIE = str(ds.get("cookie", "")).strip()
+        DEEPSEEK_DEVICE_ID = str(ds.get("device_id", "")).strip()
+        if "search_enabled" in ds:
+            DEEPSEEK_SEARCH = bool(ds["search_enabled"])
 
     # —— 搜索 Key（环境变量优先）——
     TAVILY_API_KEY = (
@@ -166,8 +188,13 @@ def _load_config() -> None:
     # —— provider：环境变量 > config.json > local ——
     env_provider = os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower()
     file_provider = str(data.get("provider", "")).strip().lower()
-    if env_provider in {"local", "cloud"}:
+    if env_provider in {"ds-cloud", "deepseek"}:
+        PROVIDER = "cloud"
+        API_STYLE = "deepseek"
+        PROVIDER_FROM_ENV = True
+    elif env_provider in {"local", "cloud"}:
         PROVIDER = env_provider
+        API_STYLE = "openai"
         PROVIDER_FROM_ENV = True
     elif file_provider in {"local", "cloud"}:
         PROVIDER = file_provider
@@ -177,7 +204,15 @@ def _load_config() -> None:
     else:
         PROVIDER = "local"
 
-    if PROVIDER == "cloud":
+    if PROVIDER == "cloud" and API_STYLE == "deepseek":
+        if not DEEPSEEK_BASE:
+            CONFIG_ERROR = (
+                "deepseek 需要 config.json 里的 deepseek.base_url，"
+                "例如 https://chat.deepseek.com"
+            )
+            return
+        BASE = DEEPSEEK_BASE
+    elif PROVIDER == "cloud":
         if not path.exists():
             CONFIG_ERROR = (
                 f"未找到配置文件：{CONFIG_PATH}\n"
@@ -199,21 +234,38 @@ SAMPLING_BASE: dict = dict(SAMPLING)
 
 
 def cloud_available() -> bool:
-    """config.json 里是否配好了可用的云端模型。"""
+    """config.json 里是否配好了可用的 OpenAI 兼容云端模型。"""
     return bool(CLOUD_BASE and MODEL_NAME)
 
 
+def deepseek_available() -> bool:
+    """config.json 里是否配了 deepseek 的地址。"""
+    return bool(DEEPSEEK_BASE)
+
+
 def use_cloud() -> None:
-    """运行时切到云端模型（菜单选择）。"""
-    global PROVIDER, BASE
+    """运行时切到 OpenAI 兼容云端模型（菜单选择）。"""
+    global PROVIDER, API_STYLE, BASE
     PROVIDER = "cloud"
+    API_STYLE = "openai"
     BASE = CLOUD_BASE
+
+
+def use_deepseek() -> None:
+    """运行时切到 deepseek。"""
+    global PROVIDER, API_STYLE, BASE
+    PROVIDER = "cloud"
+    API_STYLE = "deepseek"
+    BASE = DEEPSEEK_BASE
+    from agent.deepseek import reset_session
+    reset_session()
 
 
 def use_local() -> None:
     """运行时切到本地 llama-server。"""
-    global PROVIDER, BASE
+    global PROVIDER, API_STYLE, BASE
     PROVIDER = "local"
+    API_STYLE = "openai"
     BASE = f"http://{HOST}:{PORT}"
 
 

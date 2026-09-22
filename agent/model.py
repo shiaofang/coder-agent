@@ -16,6 +16,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from agent import config
+from agent.deepseek import ContentFilter, complete_plain, parse_tool_calls, stream_chat
 from agent.config import (
     MAX_REASONING_CHARS,
     REASONING_LOOP_MIN_UNIT,
@@ -123,8 +124,61 @@ def _extract_stats(obj: dict, stats: dict) -> None:
             stats["predicted_n"] = usage["completion_tokens"]
 
 
+def _chat_once_deepseek(messages: list[dict]) -> ChatResult:
+    """deepseek 网页协议：流式返回，工具调用从 <tool_call> 标记里还原。"""
+    result = ChatResult()
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    filt = ContentFilter()
+    announced_tools = False
+    reasoning_len_at_last_check = 0
+
+    renderer = StreamRenderer()
+    renderer.start()
+    try:
+        for piece in stream_chat(messages):
+            if piece.usage is not None:
+                result.stats["accumulated_token_usage"] = piece.usage
+            if piece.reasoning:
+                renderer.on_reasoning(piece.reasoning)
+                reasoning_parts.append(piece.reasoning)
+                total_reasoning_len = sum(len(part) for part in reasoning_parts)
+                if total_reasoning_len > MAX_REASONING_CHARS:
+                    result.looped = True
+                elif total_reasoning_len - reasoning_len_at_last_check >= 150:
+                    reasoning_len_at_last_check = total_reasoning_len
+                    if _detect_reasoning_loop("".join(reasoning_parts)):
+                        result.looped = True
+                if result.looped:
+                    renderer.abort()
+                    warn("检测到重复思考循环，已中断本次生成")
+                    break
+            if piece.content:
+                content_parts.append(piece.content)
+                visible = filt.feed(piece.content)
+                if visible:
+                    renderer.on_content(visible)
+                if filt.seen_tool and not announced_tools:
+                    announced_tools = True
+                    renderer.on_tool_calls()
+    except BaseException:
+        renderer.abort()
+        raise
+    renderer.finish()
+
+    visible, tools = parse_tool_calls("".join(content_parts))
+    if result.looped:
+        tools = []
+    result.content = visible
+    result.tool_calls = tools
+    result.reasoning = "".join(reasoning_parts)
+    return result
+
+
 def chat_once(messages: list[dict]) -> ChatResult:
     """One model turn: 流式渲染到终端，返回内容 / tool_calls / 思考 / 统计。"""
+    if config.API_STYLE == "deepseek":
+        return _chat_once_deepseek(messages)
     payload = _base_payload(messages)
     payload["tools"] = get_tools()
     payload["tool_choice"] = "auto"
@@ -232,6 +286,8 @@ def chat_once(messages: list[dict]) -> ChatResult:
 
 def chat_plain(messages: list[dict], max_tokens: int = 1200) -> str:
     """不带工具、不渲染的一次请求（上下文压缩摘要用）。返回纯文本。"""
+    if config.API_STYLE == "deepseek":
+        return complete_plain(messages)
     payload = _base_payload(messages)
     payload["stream"] = False
     payload["max_tokens"] = max_tokens

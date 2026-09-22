@@ -7,6 +7,14 @@
   "model": "",
   "api_key": "",
 
+  "deepseek": {
+    "base_url": "https://chat.deepseek.com",
+    "api_key": "",
+    "cookie": "",
+    "device_id": "",
+    "search_enabled": false
+  },
+
   "tavily_api_key": "",
 
   "server": {

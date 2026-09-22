@@ -227,12 +227,13 @@ def _write_last_model(name: str) -> None:
 
 
 def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInfo | str | None:
-    """交互选择。返回 ModelInfo / "cloud" / "attach" / None（取消）。"""
+    """交互选择。返回 ModelInfo / "cloud" / "ds-cloud" / "attach" / None（取消）。"""
     models = list_models()
     show_cloud = allow_cloud and config.cloud_available()
-    if not models and not show_cloud and not allow_attach:
-        error(f"models\\ 下没有 .gguf 文件，config.json 也没配云端模型")
-        console.print("  [dim]本地：把 GGUF 放进 models\\ ；云端：复制 config.example.json 为 config.json 填好 base_url / model[/]")
+    show_ds = allow_cloud and config.deepseek_available()
+    if not models and not show_cloud and not show_ds and not allow_attach:
+        error("models\\ 下没有 .gguf 文件，config.json 也没配云端模型")
+        console.print("  [dim]本地：把 GGUF 放进 models\\ ；云端：填 base_url / model；deepseek：填 deepseek.base_url[/]")
         return None
 
     last = _read_last_model()
@@ -264,15 +265,22 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
             depth,
         )
     extra_idx = len(models)
-    cloud_idx = attach_idx = 0
+    cloud_idx = ds_idx = attach_idx = 0
     if show_cloud:
         extra_idx += 1
         cloud_idx = extra_idx
         mark = " [dim](上次)[/]" if last == "cloud" else ""
         # 上次用的是云端，或没有记录但 config.json 写的是 provider=cloud → 默认选云端
-        if last == "cloud" or (not last and config.PROVIDER == "cloud"):
+        if last == "cloud" or (not last and config.PROVIDER == "cloud" and config.API_STYLE != "deepseek"):
             default_idx = cloud_idx
         table.add_row(str(cloud_idx), f"☁ 云端 {config.MODEL_NAME}{mark}", "", "", "", "")
+    if show_ds:
+        extra_idx += 1
+        ds_idx = extra_idx
+        mark = " [dim](上次)[/]" if last in {"ds-cloud", "deepseek"} else ""
+        if last in {"ds-cloud", "deepseek"} or (not last and config.API_STYLE == "deepseek"):
+            default_idx = ds_idx
+        table.add_row(str(ds_idx), f"☁ deepseek{mark}", "", "", "", "")
     if allow_attach:
         extra_idx += 1
         attach_idx = extra_idx
@@ -300,9 +308,12 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
         if not 1 <= choice <= extra_idx:
             warn(f"超出范围，输入 1-{extra_idx}")
             continue
-        if choice == cloud_idx:
+        if cloud_idx and choice == cloud_idx:
             _write_last_model("cloud")
             return "cloud"
+        if ds_idx and choice == ds_idx:
+            _write_last_model("deepseek")
+            return "ds-cloud"
         if choice == attach_idx:
             return "attach"
         m = models[choice - 1]
@@ -664,8 +675,21 @@ def current_model() -> ModelInfo | None:
 #  启动流程 / 切换
 # ------------------------------------------------------------------------
 
+def _activate_ds_cloud() -> bool:
+    if not config.deepseek_available():
+        error("config.json 缺 deepseek.base_url，无法使用 deepseek")
+        return False
+    config.use_deepseek()
+    config.MODEL_LABEL = "deepseek"
+    config.MODEL_PARAMS_B = None
+    config.MODEL_N_CTX = 0
+    return True
+
+
 def ensure_backend() -> bool:
     """程序启动时：决定用云端还是本地；本地则选模型并启动。返回是否就绪。"""
+    if config.PROVIDER_FROM_ENV and config.API_STYLE == "deepseek":
+        return _activate_ds_cloud()
     if config.PROVIDER == "cloud" and config.PROVIDER_FROM_ENV:
         config.MODEL_LABEL = config.MODEL_NAME
         return True
@@ -686,6 +710,8 @@ def ensure_backend() -> bool:
         config.use_cloud()
         config.MODEL_LABEL = config.MODEL_NAME
         return True
+    if choice == "ds-cloud":
+        return _activate_ds_cloud()
     if choice == "attach":
         config.use_local()
         apply_props()
@@ -696,7 +722,10 @@ def ensure_backend() -> bool:
 
 def switch_model() -> bool:
     """/model：重新选一个本地 GGUF 并重启服务。失败时保留旧服务（若仍在）。"""
-    choice = pick_model(allow_cloud=config.cloud_available(), allow_attach=False)
+    choice = pick_model(
+        allow_cloud=config.cloud_available() or config.deepseek_available(),
+        allow_attach=False,
+    )
     if choice is None:
         return False
     if choice == "cloud":
@@ -706,6 +735,12 @@ def switch_model() -> bool:
         config.MODEL_PARAMS_B = None
         config.MODEL_N_CTX = 0
         info(f"已切换到云端模型 {config.MODEL_NAME}")
+        return True
+    if choice == "ds-cloud":
+        stop()
+        if not _activate_ds_cloud():
+            return False
+        info("已切换到 deepseek")
         return True
     if _state.model is not None and choice.path == _state.model.path and is_healthy():
         info("已经是当前模型")
