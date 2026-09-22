@@ -133,7 +133,7 @@ def _chat_once_deepseek(messages: list[dict]) -> ChatResult:
     announced_tools = False
     reasoning_len_at_last_check = 0
 
-    renderer = StreamRenderer()
+    renderer = StreamRenderer("深度思考中…" if config.THINKING else "Working…")
     renderer.start()
     try:
         for piece in stream_chat(messages):

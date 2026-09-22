@@ -87,8 +87,8 @@ def _fmt_k(n: int | float) -> str:
 class StreamRenderer:
     """一次 chat_once 的终端渲染：spinner → 思考（折叠）→ markdown 回复。"""
 
-    def __init__(self) -> None:
-        self._status = console.status("[dim]Working…[/]", spinner="dots")
+    def __init__(self, status: str = "Working…") -> None:
+        self._status = console.status(f"[dim]{status}[/]", spinner="dots")
         self._status_on = False
         self._live: Live | None = None
         self._mode = ""  # "" | "think" | "reply"
@@ -135,8 +135,9 @@ class StreamRenderer:
         self._stop_live()
         full = "".join(self._reasoning)
         secs = time.time() - self._think_started
-        if config.VERBOSE and full.strip():
-            console.print(Text("∴ Thinking", style="magenta"))
+        show_body = config.VERBOSE or config.API_STYLE == "deepseek"
+        if show_body and full.strip():
+            console.print(Text("∴ 深度思考", style="magenta"))
             console.print(Text("\n".join("  " + ln for ln in full.strip().splitlines()), style="dim italic"))
         console.print(f"[magenta]∴[/] [dim]思考 {_fmt_k(len(full))} 字 · {secs:.1f}s[/]")
         self._mode = ""

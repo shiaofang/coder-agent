@@ -680,6 +680,7 @@ def _activate_ds_cloud() -> bool:
         error("config.json 缺 deepseek.base_url，无法使用 deepseek")
         return False
     config.use_deepseek()
+    config.THINKING = True
     config.MODEL_LABEL = "deepseek"
     config.MODEL_PARAMS_B = None
     config.MODEL_N_CTX = 0
