@@ -278,12 +278,12 @@ SLASH_MENU: list[tuple[str, str]] = [
 # 安全与性能上限：
 #   MAX_TOOL_ROUNDS     — 一轮用户任务里，最多允许「模型调工具」多少次，防止死循环
 #   MAX_READ_CHARS      — 读文件返回给模型的最大字符数，避免上下文爆掉
-#   MAX_REASONING_*     — 思考阶段若重复啰嗦，用来检测并打断
+#   MAX_REASONING_*     — 思考末尾连续自我复制时打断；长度只做 runaway 上限
 MAX_TOOL_ROUNDS = 48
 MAX_READ_CHARS = 80_000
-MAX_REASONING_CHARS = 6000
-REASONING_LOOP_NGRAM = 24
-REASONING_LOOP_THRESHOLD = 4
+MAX_REASONING_CHARS = 24_000
+REASONING_LOOP_MIN_UNIT = 40
+REASONING_LOOP_REPEATS = 5
 MAX_REASONING_ABORTS = 3
 
 # 上下文压缩阈值（占 n_ctx 的比例）

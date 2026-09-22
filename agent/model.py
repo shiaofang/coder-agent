@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from agent import config
 from agent.config import (
     MAX_REASONING_CHARS,
-    REASONING_LOOP_NGRAM,
-    REASONING_LOOP_THRESHOLD,
+    REASONING_LOOP_MIN_UNIT,
+    REASONING_LOOP_REPEATS,
 )
 from agent.render import StreamRenderer, console, warn
 from agent.tools_schema import get_tools
@@ -71,21 +71,25 @@ def wait_ready(retries: int = 120) -> bool:
 
 def _detect_reasoning_loop(
     text: str,
-    ngram: int = REASONING_LOOP_NGRAM,
-    threshold: int = REASONING_LOOP_THRESHOLD,
+    min_unit: int = REASONING_LOOP_MIN_UNIT,
+    repeats: int = REASONING_LOOP_REPEATS,
 ) -> bool:
-    """Cheap n-gram repetition detector for degenerate 'thinking' loops."""
-    if len(text) < ngram * threshold:
+    """只认思考末尾的连续自我复制（ABCABCABC…），那才是卡死。
+
+    旧实现是全文滑窗数 n-gram：同一条 Windows 路径、同一个函数名
+    在正常分析里提四次就会误报。
+    """
+    if repeats < 2:
         return False
-    counts: dict[str, int] = {}
-    step = max(1, ngram // 2)
-    for i in range(0, len(text) - ngram, step):
-        gram = text[i : i + ngram]
-        if not gram.strip():
+    need = min_unit * repeats
+    if len(text) < need:
+        return False
+    max_unit = min(240, len(text) // repeats)
+    for unit in range(min_unit, max_unit + 1):
+        chunk = text[-unit:]
+        if not chunk.strip():
             continue
-        n = counts.get(gram, 0) + 1
-        counts[gram] = n
-        if n >= threshold:
+        if text.endswith(chunk * repeats):
             return True
     return False
 
