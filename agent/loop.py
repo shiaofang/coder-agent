@@ -12,7 +12,12 @@ import re
 import time
 
 from agent import config, context
-from agent.config import MAX_REASONING_ABORTS, MAX_TOOL_ROUNDS
+from agent.config import (
+    MAX_EMPTY_RESPONSE_RETRIES,
+    MAX_REASONING_ABORTS,
+    MAX_TOOL_PROTOCOL_RETRIES,
+    MAX_TOOL_ROUNDS,
+)
 from agent.model import chat_once
 from agent.render import console, error, show_tool_call, show_tool_result, show_turn_stats, warn
 from agent.terminal import TOOL_SKIPPED_MESSAGE, ask_tool_approval, flush_input_buffer
@@ -131,6 +136,8 @@ def run_agent_turn(messages: list[dict]) -> None:
     last_error_fp = ""  # 当前正卡住的错误指纹；换了新错误就重置下面的搜索标记
     searched_this_error = False
     reasoning_abort_count = 0
+    tool_protocol_retry_count = 0
+    empty_response_retry_count = 0
     research_call_count = 0  # 连续 web_search/fetch_url 次数，中间没有真正去改代码
     grep_streak = 0  # 连续 grep_search 次数，用于识别"逐个属性瞎猜"
     failed_path_counts: dict[str, int] = {}  # 同一路径反复不存在时，明确阻止把类型标记当路径
@@ -166,11 +173,43 @@ def run_agent_turn(messages: list[dict]) -> None:
                     messages,
                 )
 
-            if res.looped:
-                reasoning_abort_count += 1
-                if reasoning_abort_count > MAX_REASONING_ABORTS:
+            if res.tool_protocol_error:
+                reasoning_abort_count = 0
+                empty_response_retry_count = 0
+                tool_protocol_retry_count += 1
+                if tool_protocol_retry_count > MAX_TOOL_PROTOCOL_RETRIES:
                     error(
-                        f"模型连续 {reasoning_abort_count} 次陷入重复思考，已停止本轮。"
+                        "DeepSeek 连续返回残缺的工具调用格式，已停止本轮。"
+                        "[dim] 请重试，或用 /new 后换一种说法。[/]"
+                    )
+                    finish_stats()
+                    return
+                warn(
+                    f"工具调用格式残缺，未执行；正在让 DeepSeek 重试"
+                    f"（{tool_protocol_retry_count}/{MAX_TOOL_PROTOCOL_RETRIES}）"
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[系统提示] 你上一条工具调用格式残缺，因此没有执行。"
+                            "请重新输出完整 DSML：每个工具必须有 "
+                            '<｜DSML｜invoke name="工具名"> 开始标签和对应结束标签；'
+                            "每个参数必须使用完整的 parameter 开始/结束标签，并位于 invoke 内。"
+                            "只输出修正后的工具调用，不要解释。"
+                        ),
+                    }
+                )
+                continue
+
+            if res.looped:
+                tool_protocol_retry_count = 0
+                empty_response_retry_count = 0
+                reasoning_abort_count += 1
+                reason = "思考超出长度上限" if res.loop_reason == "length" else "思考末尾连续重复"
+                if reasoning_abort_count >= MAX_REASONING_ABORTS:
+                    error(
+                        f"模型连续 {reasoning_abort_count} 次被中断（本次：{reason}），已停止本轮。"
                         "[dim] 可尝试换个说法、拆小任务、/think off，或换更大的模型。[/]"
                     )
                     finish_stats()
@@ -179,17 +218,24 @@ def run_agent_turn(messages: list[dict]) -> None:
                     {
                         "role": "user",
                         "content": (
-                            "[系统提示] 你刚才的思考陷入重复循环，已被中断。"
+                            f"[系统提示] 你刚才因{reason}而被中断。"
                             "禁止继续长篇分析或重复相同句子，直接给出下一步工具调用；"
                             "如果信息已经够用，直接给出简短结论。"
                         ),
                     }
                 )
+                if config.API_STYLE == "deepseek":
+                    # 网页端断开流后会短暂保留 WIP 状态，给服务端时间完成取消。
+                    time.sleep(0.75)
                 continue
 
+            # 只统计连续中断；一次正常回复或工具调用代表模型已经恢复。
+            reasoning_abort_count = 0
+            tool_protocol_retry_count = 0
             content, tool_calls, reasoning = res.content, res.tool_calls, res.reasoning
 
             if tool_calls:
+                empty_response_retry_count = 0
                 assistant_msg: dict = {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
                 if reasoning:
                     assistant_msg["reasoning_content"] = reasoning
@@ -343,10 +389,34 @@ def run_agent_turn(messages: list[dict]) -> None:
 
             # final answer（走到这里说明没有 tool_calls）
             if content:
+                empty_response_retry_count = 0
                 messages.append({"role": "assistant", "content": content})
                 calibrate()
             else:
-                console.print("[dim](empty response)[/]")
+                empty_response_retry_count += 1
+                if empty_response_retry_count > MAX_EMPTY_RESPONSE_RETRIES:
+                    error(
+                        "模型连续只返回思考、没有正文或工具调用，已停止本轮。"
+                        "[dim] 请重试，或用 /new 后换一种说法。[/]"
+                    )
+                    finish_stats()
+                    return
+                warn(
+                    f"模型没有给出最终回复，正在要求其继续并总结"
+                    f"（{empty_response_retry_count}/{MAX_EMPTY_RESPONSE_RETRIES}）"
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[系统提示] 你上一条只有思考，没有正文或工具调用。"
+                            "如果任务尚未完成，立即输出下一步完整工具调用；"
+                            "如果已经完成，立即用简短中文总结改动、涉及文件和验证结果。"
+                            "不要继续分析，不要返回空回复。"
+                        ),
+                    }
+                )
+                continue
             finish_stats()
             return
 

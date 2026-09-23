@@ -16,8 +16,16 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from agent import config
-from agent.deepseek import ContentFilter, complete_plain, parse_tool_calls, stream_chat
+from agent.deepseek import (
+    ContentFilter,
+    complete_plain,
+    has_tool_call_markup,
+    parse_tool_calls,
+    reset_session as reset_deepseek_session,
+    stream_chat,
+)
 from agent.config import (
+    DEEPSEEK_MAX_REASONING_CHARS,
     MAX_REASONING_CHARS,
     REASONING_LOOP_MIN_UNIT,
     REASONING_LOOP_REPEATS,
@@ -32,6 +40,8 @@ class ChatResult:
     tool_calls: list[dict] = field(default_factory=list)
     reasoning: str = ""
     looped: bool = False
+    loop_reason: str = ""
+    tool_protocol_error: str = ""
     # 服务端统计：prompt_n / predicted_n / predicted_per_second（llama-server timings）
     stats: dict = field(default_factory=dict)
 
@@ -95,6 +105,13 @@ def _detect_reasoning_loop(
     return False
 
 
+def _warn_reasoning_abort(reason: str, length: int) -> None:
+    if reason == "length":
+        warn(f"思考已超过安全上限（{length} 字），已中断本次生成")
+    else:
+        warn("检测到思考末尾连续重复，已中断本次生成")
+
+
 def _base_payload(messages: list[dict]) -> dict:
     payload: dict = {"messages": messages, "stream": True}
     for key, val in config.SAMPLING.items():
@@ -125,7 +142,7 @@ def _extract_stats(obj: dict, stats: dict) -> None:
 
 
 def _chat_once_deepseek(messages: list[dict]) -> ChatResult:
-    """deepseek 网页协议：流式返回，工具调用从 <tool_call> 标记里还原。"""
+    """DeepSeek 网页协议：流式返回，把 DSML 调用还原成 OpenAI tool_calls。"""
     result = ChatResult()
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -135,23 +152,26 @@ def _chat_once_deepseek(messages: list[dict]) -> ChatResult:
 
     renderer = StreamRenderer("深度思考中…" if config.THINKING else "Working…")
     renderer.start()
+    stream = stream_chat(messages)
     try:
-        for piece in stream_chat(messages):
+        for piece in stream:
             if piece.usage is not None:
                 result.stats["accumulated_token_usage"] = piece.usage
             if piece.reasoning:
                 renderer.on_reasoning(piece.reasoning)
                 reasoning_parts.append(piece.reasoning)
                 total_reasoning_len = sum(len(part) for part in reasoning_parts)
-                if total_reasoning_len > MAX_REASONING_CHARS:
+                if total_reasoning_len > DEEPSEEK_MAX_REASONING_CHARS:
                     result.looped = True
+                    result.loop_reason = "length"
                 elif total_reasoning_len - reasoning_len_at_last_check >= 150:
                     reasoning_len_at_last_check = total_reasoning_len
                     if _detect_reasoning_loop("".join(reasoning_parts)):
                         result.looped = True
+                        result.loop_reason = "repeat"
                 if result.looped:
                     renderer.abort()
-                    warn("检测到重复思考循环，已中断本次生成")
+                    _warn_reasoning_abort(result.loop_reason, total_reasoning_len)
                     break
             if piece.content:
                 content_parts.append(piece.content)
@@ -164,11 +184,23 @@ def _chat_once_deepseek(messages: list[dict]) -> ChatResult:
     except BaseException:
         renderer.abort()
         raise
+    finally:
+        if result.looped:
+            # 主动断流后服务端可能仍把消息标记为 WIP；旧会话不可继续复用。
+            stream.close()
+            reset_deepseek_session()
+    trailing = filt.flush()
+    if trailing:
+        renderer.on_content(trailing)
     renderer.finish()
 
     visible, tools = parse_tool_calls("".join(content_parts))
     if result.looped:
         tools = []
+    elif has_tool_call_markup(visible):
+        tools = []
+        visible = ""
+        result.tool_protocol_error = "DeepSeek 返回的工具调用标记不完整或参数标签不合法"
     result.content = visible
     result.tool_calls = tools
     result.reasoning = "".join(reasoning_parts)
@@ -230,13 +262,15 @@ def chat_once(messages: list[dict]) -> ChatResult:
                 total_reasoning_len = sum(len(r) for r in reasoning_parts)
                 if total_reasoning_len > MAX_REASONING_CHARS:
                     result.looped = True
+                    result.loop_reason = "length"
                 elif total_reasoning_len - reasoning_len_at_last_check >= 150:
                     reasoning_len_at_last_check = total_reasoning_len
                     if _detect_reasoning_loop("".join(reasoning_parts)):
                         result.looped = True
+                        result.loop_reason = "repeat"
                 if result.looped:
                     renderer.abort()
-                    warn("检测到重复思考循环，已中断本次生成")
+                    _warn_reasoning_abort(result.loop_reason, total_reasoning_len)
                     break
 
             if content:

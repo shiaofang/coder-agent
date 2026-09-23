@@ -1,8 +1,8 @@
 """DeepSeek 网页协议客户端：/api/v0/chat/completion。
 
 请求体是单条 prompt + chat_session_id，返回 SSE 补丁流（APPEND / SET / BATCH），
-没有 OpenAI 的 tools 字段。工具调用约定写进 prompt，用 <tool_call> 标记收回，
-再还原成 loop.py 认识的 tool_calls。
+没有 OpenAI 的 tools 字段。工具调用约定写进 prompt，用 DeepSeek DSML 标记收回，
+再还原成 loop.py 认识的 OpenAI tool_calls（同时兼容旧 <tool_call> 标记）。
 
 服务端按会话记住历史，所以只把「上次成功之后新出现的用户/工具消息」发出去。
 本地 messages 被 /compact、/new 改写时，摘要对不上就另开会话，把全文重发。
@@ -25,16 +25,46 @@ from pathlib import Path
 from agent import config
 from agent.tools_schema import get_tools
 
-_TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_DSML_TOKEN = "｜DSML｜"
+_DSML_MARKER_RE = r"(?:[|｜]\s*)+DSML\s*(?:[|｜]\s*)+"
+_DSML_CALL_BLOCK_NAME_RE = r"(?:tool_calls|function_calls|calls)"
+_DSML_OPEN_RE = re.compile(
+    rf"<{_DSML_MARKER_RE}{_DSML_CALL_BLOCK_NAME_RE}\s*>",
+    re.IGNORECASE,
+)
+_DSML_CLOSE_RE = re.compile(
+    rf"</{_DSML_MARKER_RE}{_DSML_CALL_BLOCK_NAME_RE}\s*>",
+    re.IGNORECASE,
+)
+_DSML_ANY_TAG_RE = re.compile(rf"<\s*/?\s*{_DSML_MARKER_RE}", re.IGNORECASE)
+_CALL_BLOCK_RE = re.compile(
+    rf"<tool_call>\s*(?P<standard>.*?)\s*</tool_call>"
+    rf"|(?P<dsml><{_DSML_MARKER_RE}{_DSML_CALL_BLOCK_NAME_RE}\s*>.*?"
+    rf"</{_DSML_MARKER_RE}{_DSML_CALL_BLOCK_NAME_RE}\s*>)",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_INVOKE_RE = re.compile(
+    rf"<{_DSML_MARKER_RE}invoke\b(?P<attrs>[^>]*)>(?P<body>.*?)"
+    rf"</{_DSML_MARKER_RE}invoke\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_PARAMETER_RE = re.compile(
+    rf"<{_DSML_MARKER_RE}parameter\b(?P<attrs>[^>]*)>(?P<value>.*?)"
+    rf"</{_DSML_MARKER_RE}parameter\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
 _THINK_TYPES = {"THINK", "THINKING", "THOUGHT"}
 _ANSWER_TYPES = {"RESPONSE", "REPLY"}
 
-_TOOL_GUIDE = """需要调用工具时，只输出下面这种标记，不要用 markdown 代码块包住。arguments 必须是 JSON 对象。可以连续输出多个标记。标记以外不要解释你准备调用工具。
+_TOOL_GUIDE = f"""需要调用工具时，只输出下面这种 DeepSeek DSML 标记，不要用 markdown 代码块包住。一个块里可以连续放多个 invoke。标记以外不要解释你准备调用工具。
+字符串参数使用 string="true" 并直接填写原文；数字、布尔值、数组和对象使用 string="false" 并填写合法 JSON。
 不需要工具时直接用中文回答，不要输出该标记。
 
-<tool_call>
-{"name":"read_file","arguments":{"path":"文件路径"}}
-</tool_call>
+<{_DSML_TOKEN}tool_calls>
+<{_DSML_TOKEN}invoke name="read_file">
+<{_DSML_TOKEN}parameter name="path" string="true">文件路径</{_DSML_TOKEN}parameter>
+</{_DSML_TOKEN}invoke>
+</{_DSML_TOKEN}tool_calls>
 
 可用工具：
 """
@@ -58,6 +88,10 @@ class _Session:
 _state = _Session()
 
 
+class _MessageStillWipError(RuntimeError):
+    """DeepSeek 仍把当前网页会话标记为生成中。"""
+
+
 def reset_session() -> None:
     """丢掉服务端会话。下一轮会新建，并重发当前本地历史。"""
     global _state
@@ -65,43 +99,74 @@ def reset_session() -> None:
 
 
 class ContentFilter:
-    """流式输出时藏住 <tool_call>…</tool_call>，避免把工具 JSON 画进回复。"""
+    """流式藏住自定义或 DSML 工具块，避免把调用协议画进回复。"""
 
-    OPEN = "<tool_call>"
-    CLOSE = "</tool_call>"
+    STANDARD_OPEN = "<tool_call>"
+    STANDARD_CLOSE = "</tool_call>"
 
     def __init__(self) -> None:
         self.buf = ""
-        self.inside = False
+        self.inside = ""
         self.seen_tool = False
 
     def feed(self, text: str) -> str:
         self.buf += text
         out: list[str] = []
         while self.buf:
-            if self.inside:
-                idx = self.buf.find(self.CLOSE)
+            if self.inside == "standard":
+                idx = self.buf.find(self.STANDARD_CLOSE)
                 if idx < 0:
-                    keep = _partial_suffix(self.buf, self.CLOSE)
+                    keep = _partial_suffix(self.buf, self.STANDARD_CLOSE)
                     self.buf = self.buf[-keep:] if keep else ""
                     break
-                self.buf = self.buf[idx + len(self.CLOSE) :]
-                self.inside = False
+                self.buf = self.buf[idx + len(self.STANDARD_CLOSE) :]
+                self.inside = ""
                 continue
-            idx = self.buf.find(self.OPEN)
-            if idx < 0:
-                keep = _partial_suffix(self.buf, self.OPEN)
+            if self.inside == "dsml":
+                close = _DSML_CLOSE_RE.search(self.buf)
+                if close is None:
+                    # 正文无需保留，只留下可能跨 chunk 的未闭合标签头。
+                    tag = self.buf.rfind("<")
+                    self.buf = self.buf[tag:] if tag >= 0 and ">" not in self.buf[tag:] else ""
+                    break
+                self.buf = self.buf[close.end() :]
+                self.inside = ""
+                continue
+
+            standard_idx = self.buf.find(self.STANDARD_OPEN)
+            dsml = _DSML_OPEN_RE.search(self.buf)
+            dsml_idx = dsml.start() if dsml is not None else -1
+            indexes = [idx for idx in (standard_idx, dsml_idx) if idx >= 0]
+            if not indexes:
+                keep = _partial_suffix(self.buf, self.STANDARD_OPEN)
+                for prefix in ("<|", "<｜"):
+                    start = self.buf.rfind(prefix)
+                    if start >= 0 and ">" not in self.buf[start:]:
+                        keep = max(keep, len(self.buf) - start)
                 emit = self.buf[:-keep] if keep else self.buf
                 self.buf = self.buf[-keep:] if keep else ""
                 if emit:
                     out.append(emit)
                 break
+            idx = min(indexes)
             if idx:
                 out.append(self.buf[:idx])
-            self.buf = self.buf[idx + len(self.OPEN) :]
-            self.inside = True
+            if idx == standard_idx:
+                self.buf = self.buf[idx + len(self.STANDARD_OPEN) :]
+                self.inside = "standard"
+            else:
+                self.buf = self.buf[dsml.end() :] if dsml is not None else ""
+                self.inside = "dsml"
             self.seen_tool = True
         return "".join(out)
+
+    def flush(self) -> str:
+        """生成结束时吐出未进入工具块的普通文本尾部。"""
+        if self.inside:
+            self.buf = ""
+            return ""
+        text, self.buf = self.buf, ""
+        return text
 
 
 class Assembler:
@@ -289,42 +354,158 @@ class Assembler:
 
 
 def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """从回复里抽出工具调用。解析失败的标记原样留在正文里。"""
+    """抽出自定义 XML 或 DeepSeek DSML，统一成 OpenAI tool_calls。"""
     calls: list[dict] = []
     visible: list[str] = []
     last = 0
-    for match in _TOOL_RE.finditer(text):
+    for match in _CALL_BLOCK_RE.finditer(text):
         visible.append(text[last : match.start()])
-        obj = _load_obj(match.group(1))
-        name = ""
-        args: object = {}
-        if isinstance(obj, dict):
-            name = str(obj.get("name") or obj.get("tool") or "").strip()
-            if not name and isinstance(obj.get("function"), dict):
-                name = str(obj["function"].get("name") or "").strip()
-                args = obj["function"].get("arguments") or {}
-            else:
-                args = obj.get("arguments", obj.get("parameters", {}))
-        if name:
-            if not isinstance(args, str):
-                args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
-            calls.append({
-                "id": f"call_{len(calls) + 1}",
-                "type": "function",
-                "function": {"name": name, "arguments": args},
-            })
+        if match.group("standard") is not None:
+            parsed = _parse_standard_call(match.group("standard"))
         else:
+            parsed = _parse_dsml_calls(match.group("dsml") or "")
+        if parsed is None:
             visible.append(match.group(0))
+        else:
+            for name, args in parsed:
+                calls.append(_openai_tool_call(name, args, len(calls) + 1))
         last = match.end()
     visible.append(text[last:])
     return "".join(visible).strip(), calls
 
 
+def has_tool_call_markup(text: str) -> bool:
+    """回复中是否还残留未解析的工具协议标记。"""
+    return bool(
+        re.search(r"<\s*/?\s*tool_call\b", text, re.IGNORECASE)
+        or _DSML_ANY_TAG_RE.search(text)
+    )
+
+
+def _parse_standard_call(raw: str) -> list[tuple[str, object]] | None:
+    obj = _load_obj(raw)
+    if not isinstance(obj, dict):
+        return None
+    name = str(obj.get("name") or obj.get("tool") or "").strip()
+    if not name and isinstance(obj.get("function"), dict):
+        name = str(obj["function"].get("name") or "").strip()
+        args = obj["function"].get("arguments") or {}
+    else:
+        args = obj.get("arguments", obj.get("parameters", {}))
+    return [(name, args)] if name else None
+
+
+def _parse_dsml_calls(block: str) -> list[tuple[str, object]] | None:
+    parsed: list[tuple[str, object]] = []
+    invokes = list(_DSML_INVOKE_RE.finditer(block))
+    if not invokes:
+        return None
+    inner = re.sub(
+        rf"\A\s*<{_DSML_MARKER_RE}{_DSML_CALL_BLOCK_NAME_RE}\s*>",
+        "",
+        block,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    inner = re.sub(
+        rf"</{_DSML_MARKER_RE}{_DSML_CALL_BLOCK_NAME_RE}\s*>\s*\Z",
+        "",
+        inner,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if _DSML_INVOKE_RE.sub("", inner).strip():
+        return None
+    for invoke in invokes:
+        name = _xml_attr(invoke.group("attrs"), "name")
+        if not name:
+            return None
+        body = invoke.group("body")
+        params = list(_DSML_PARAMETER_RE.finditer(body))
+        args: dict[str, object]
+        if params:
+            # 参数标签之外只能有空白；否则说明模型生成了残缺 DSML。
+            residue = _DSML_PARAMETER_RE.sub("", body)
+            if residue.strip():
+                return None
+            args = {}
+            for param in params:
+                key = _xml_attr(param.group("attrs"), "name")
+                if not key or key in args:
+                    return None
+                raw_value = param.group("value")
+                string_flag = _xml_attr(param.group("attrs"), "string").lower()
+                if string_flag == "true":
+                    value: object = raw_value
+                else:
+                    try:
+                        value = json.loads(raw_value.strip())
+                    except json.JSONDecodeError:
+                        if string_flag == "false":
+                            return None
+                        value = raw_value
+                args[key] = value
+        else:
+            raw_args = body.strip()
+            if not raw_args:
+                args = {}
+            else:
+                obj = _load_obj(raw_args)
+                if obj is None:
+                    return None
+                args = obj
+        parsed.append((name, args))
+    return parsed
+
+
+def _xml_attr(attrs: str, name: str) -> str:
+    match = re.search(
+        rf"\b{re.escape(name)}\s*=\s*([\"'])(.*?)\1",
+        attrs,
+        re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(2) if match else ""
+
+
+def _openai_tool_call(name: str, args: object, index: int) -> dict:
+    if not isinstance(args, str):
+        args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+    return {
+        "id": f"call_{index}",
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    }
+
+
 def stream_chat(messages: list[dict]):
-    """流式问一次。正常结束或已经拿到 response_message_id 后，记下会话进度。"""
+    """流式问一次；WIP 时换新会话、重发完整历史并限次退避。"""
     prompt, cont = _plan_prompt(messages)
     if not cont:
         reset_session()
+    delays = (1.0, 2.0, 4.0)
+    for attempt in range(len(delays) + 1):
+        emitted = False
+        stream = _stream_chat_request(messages, prompt, cont)
+        try:
+            for piece in stream:
+                emitted = True
+                yield piece
+            return
+        except _MessageStillWipError:
+            reset_session()
+            if emitted or attempt >= len(delays):
+                raise RuntimeError(
+                    "DeepSeek 会话持续处于生成中；已自动换会话重试，仍未恢复，请稍后再试"
+                ) from None
+            time.sleep(delays[attempt])
+            prompt = format_transcript(messages, tools=True)
+            cont = False
+        finally:
+            stream.close()
+
+
+def _stream_chat_request(messages: list[dict], prompt: str, cont: bool):
+    """执行一次网页流请求；会话恢复策略由 stream_chat 统一处理。"""
     resp = None
     response_id = None
     try:
@@ -347,6 +528,8 @@ def stream_chat(messages: list[dict]):
                 continue
             if not isinstance(obj, dict):
                 continue
+            if _is_message_still_wip_obj(obj):
+                raise _MessageStillWipError("DeepSeek message still wip")
             if obj.get("code") not in (None, 0) and "v" not in obj and "p" not in obj:
                 raise RuntimeError(f"接口返回错误：{_err_text(obj)}")
             reasoning, content = assembler.feed(obj)
@@ -583,8 +766,35 @@ def _open_completion(sid: str, parent, prompt: str, *, thinking: bool, search: b
     if "application/json" in ctype and "text/event-stream" not in ctype:
         raw = resp.read().decode("utf-8", errors="replace")
         resp.close()
+        if _is_message_still_wip(raw):
+            raise _MessageStillWipError("DeepSeek message still wip")
         raise RuntimeError(f"接口没有返回事件流：{raw[:600]}")
     return resp
+
+
+def _is_message_still_wip(raw: str) -> bool:
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return "message still wip" in raw.lower()
+    return _is_message_still_wip_obj(obj)
+
+
+def _is_message_still_wip_obj(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        return False
+    candidates = [data]
+    nested = data.get("biz_data")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    return any(
+        biz.get("biz_code") == 11
+        or "message still wip" in str(biz.get("biz_msg") or "").lower()
+        for biz in candidates
+    )
 
 
 def _request_json(method: str, path: str, body: dict) -> dict:
