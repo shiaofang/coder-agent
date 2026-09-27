@@ -15,7 +15,6 @@ from agent import config, context
 from agent.config import (
     MAX_EMPTY_RESPONSE_RETRIES,
     MAX_REASONING_ABORTS,
-    MAX_TOOL_PROTOCOL_RETRIES,
     MAX_TOOL_ROUNDS,
 )
 from agent.model import chat_once
@@ -136,7 +135,6 @@ def run_agent_turn(messages: list[dict]) -> None:
     last_error_fp = ""  # 当前正卡住的错误指纹；换了新错误就重置下面的搜索标记
     searched_this_error = False
     reasoning_abort_count = 0
-    tool_protocol_retry_count = 0
     empty_response_retry_count = 0
     research_call_count = 0  # 连续 web_search/fetch_url 次数，中间没有真正去改代码
     grep_streak = 0  # 连续 grep_search 次数，用于识别"逐个属性瞎猜"
@@ -173,37 +171,7 @@ def run_agent_turn(messages: list[dict]) -> None:
                     messages,
                 )
 
-            if res.tool_protocol_error:
-                reasoning_abort_count = 0
-                empty_response_retry_count = 0
-                tool_protocol_retry_count += 1
-                if tool_protocol_retry_count > MAX_TOOL_PROTOCOL_RETRIES:
-                    error(
-                        "DeepSeek 连续返回残缺的工具调用格式，已停止本轮。"
-                        "[dim] 请重试，或用 /new 后换一种说法。[/]"
-                    )
-                    finish_stats()
-                    return
-                warn(
-                    f"工具调用格式残缺，未执行；正在让 DeepSeek 重试"
-                    f"（{tool_protocol_retry_count}/{MAX_TOOL_PROTOCOL_RETRIES}）"
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[系统提示] 你上一条工具调用格式残缺，因此没有执行。"
-                            "请重新输出完整 DSML：每个工具必须有 "
-                            '<｜DSML｜invoke name="工具名"> 开始标签和对应结束标签；'
-                            "每个参数必须使用完整的 parameter 开始/结束标签，并位于 invoke 内。"
-                            "只输出修正后的工具调用，不要解释。"
-                        ),
-                    }
-                )
-                continue
-
             if res.looped:
-                tool_protocol_retry_count = 0
                 empty_response_retry_count = 0
                 reasoning_abort_count += 1
                 reason = "思考超出长度上限" if res.loop_reason == "length" else "思考末尾连续重复"
@@ -224,14 +192,10 @@ def run_agent_turn(messages: list[dict]) -> None:
                         ),
                     }
                 )
-                if config.API_STYLE == "deepseek":
-                    # 网页端断开流后会短暂保留 WIP 状态，给服务端时间完成取消。
-                    time.sleep(0.75)
                 continue
 
             # 只统计连续中断；一次正常回复或工具调用代表模型已经恢复。
             reasoning_abort_count = 0
-            tool_protocol_retry_count = 0
             content, tool_calls, reasoning = res.content, res.tool_calls, res.reasoning
 
             if tool_calls:

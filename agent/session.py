@@ -39,7 +39,7 @@ class Session:
                 "created": self.created,
                 "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "cwd": str(Path.cwd()),
-                "model": config.MODEL_LABEL or config.MODEL_NAME,
+                "model": config.MODEL_LABEL,
                 "messages": messages,
                 "todos": todos,
             }

@@ -100,7 +100,7 @@ def main() -> int:
     sess = session.Session()
 
     def toolbar() -> str:
-        model = (config.MODEL_LABEL or config.MODEL_NAME or "?")
+        model = (config.MODEL_LABEL or "?")
         if len(model) > 34:
             model = model[:31] + "…"
         mode = "auto" if config.AUTO_APPROVE_ALWAYS else "manual"
@@ -317,27 +317,13 @@ def main() -> int:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             error(f"HTTP {e.code}: {detail[:600]}")
-            if e.code in (401, 403):
-                if config.API_STYLE == "deepseek":
-                    warn("deepseek 不认这个密钥：把请求头 Authorization 里 Bearer 后面的内容"
-                         "填进 config.json 的 deepseek.api_key")
-                else:
-                    warn("云端接口不认这个 api_key：检查 config.json 的 api_key 是否有效/完整，"
-                         "Ollama 的 key 在 ollama.com/settings/keys 重新生成")
-            elif e.code in (400, 413) and ("context" in detail.lower() or "token" in detail.lower()):
+            if e.code in (400, 413) and ("context" in detail.lower() or "token" in detail.lower()):
                 warn("很可能是上下文超限：试试 /compact，或 /new 开新会话")
             del messages[turn_start:]
             continue
         except urllib.error.URLError as e:
             error(f"连不上模型服务：{e.reason}")
-            if config.API_STYLE == "deepseek":
-                reason = str(e.reason)
-                if "getaddrinfo" in reason or "11001" in reason:
-                    warn(f"域名解析失败：{config.DEEPSEEK_BASE} 没有 DNS 记录，请求没有发出去")
-                else:
-                    warn(f"连不上 deepseek（{config.DEEPSEEK_BASE}）。接口还没好时可以用 /model 换回本地模型")
-            elif config.PROVIDER == "local":
-                warn("llama-server 可能已退出（显存不足 / 崩溃），用 /model 重新启动")
+            warn("llama-server 可能已退出（显存不足 / 崩溃），用 /model 重新启动")
             del messages[turn_start:]
             continue
         except Exception as e:

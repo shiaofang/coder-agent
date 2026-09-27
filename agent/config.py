@@ -1,4 +1,4 @@
-"""配置常量：本地/云端模型、llama-server 参数、采样参数、搜索 Key、斜杠命令、安全上限、会话开关。
+"""配置常量：本地 GGUF / llama-server 参数、采样参数、搜索 Key、斜杠命令、安全上限、会话开关。
 
 运行时配置统一放在项目根目录的 config.json（已 gitignore）。
 模板见 config.example.json。会话开关（AUTO_APPROVE / THINKING / VERBOSE 等）
@@ -14,9 +14,6 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BIN_DIR = ROOT_DIR / "bin"
-# 三值量化（Bonsai 的 PTQ1_0 / PQ2_0）官方 llama.cpp 认不出来，
-# 需要把 PrismML 分支编出来的 llama-server 放这里；只在选到这类模型时才用。
-PRISM_BIN_DIR = ROOT_DIR / "bin-prism"
 MODEL_DIR = ROOT_DIR / "models"
 SESSION_DIR = ROOT_DIR / "sessions"
 HISTORY_FILE = ROOT_DIR / ".history"
@@ -29,23 +26,7 @@ HOST = "127.0.0.1"
 PORT = 8080
 BASE = f"http://{HOST}:{PORT}"
 
-# PROVIDER    — "local"（本机 llama-server）或 "cloud"（云端；含 OpenAI 兼容和 deepseek）
-# API_STYLE   — "openai"（/v1/chat/completions）或 "deepseek"（网页 /api/v0/chat/completion）
-# MODEL_NAME  — OpenAI 兼容云端请求体里的 model；本地可留空
-# API_KEY     — OpenAI 兼容云端鉴权；本地可留空
-# DEEPSEEK_*  — 菜单里的 deepseek，和上面的云端配置互不影响
 # CONFIG_ERROR — 配置缺失/不完整时的错误说明，main.py 启动时检查并退出
-PROVIDER = "local"
-API_STYLE = "openai"
-PROVIDER_FROM_ENV = False  # 环境变量显式指定了 provider 时不再弹「本地/云端」菜单
-CLOUD_BASE = ""  # config.json 里的 base_url（供菜单里切到云端时使用）
-MODEL_NAME = ""
-API_KEY = ""
-DEEPSEEK_BASE = ""
-DEEPSEEK_API_KEY = ""
-DEEPSEEK_COOKIE = ""
-DEEPSEEK_DEVICE_ID = ""
-DEEPSEEK_SEARCH = False
 TAVILY_API_KEY = ""
 CONFIG_ERROR: str | None = None
 
@@ -61,10 +42,6 @@ SERVER: dict = {
     "ctx": None,
     "extra_args": [],
 }
-# config.json / 环境变量里显式写过的键。模型预设（如三值 Bonsai）只填没写过的，
-# 不覆盖用户的选择。
-SERVER_EXPLICIT: set[str] = set()
-SAMPLING_EXPLICIT: set[str] = set()
 
 # 采样参数（config.json -> "sampling"），非 None 的字段才会放进请求体
 SAMPLING: dict = {
@@ -76,31 +53,19 @@ SAMPLING: dict = {
 }
 
 CONFIG_PATH = ROOT_DIR / "config.json"
-# 旧文件名：若只有 cloud_config.json，加载时提示迁移
-_LEGACY_CONFIG_PATH = ROOT_DIR / "cloud_config.json"
 
 
 def _load_config() -> None:
-    """读取 config.json，并用环境变量覆盖（CODER_AGENT_PROVIDER / 搜索 Key / NGL / CTX）。
+    """读取 config.json，并用环境变量覆盖（搜索 Key / NGL / CTX）。
 
     优先级：
-      provider — 环境变量 CODER_AGENT_PROVIDER > config.json provider > local
       搜索 Key — 环境变量 TAVILY_API_KEY > config.json tavily_api_key
       ngl/ctx  — 环境变量 CODER_AGENT_NGL / CODER_AGENT_CTX > config.json server.*
     """
-    global HOST, PORT, BASE, PROVIDER, API_STYLE, PROVIDER_FROM_ENV, CLOUD_BASE, MODEL_NAME, API_KEY
-    global DEEPSEEK_BASE, DEEPSEEK_API_KEY, DEEPSEEK_COOKIE, DEEPSEEK_DEVICE_ID, DEEPSEEK_SEARCH
-    global TAVILY_API_KEY, CONFIG_ERROR, PRISM_BIN_DIR
+    global HOST, PORT, BASE, TAVILY_API_KEY, CONFIG_ERROR
 
     data: dict = {}
     path = CONFIG_PATH
-    if not path.exists() and _LEGACY_CONFIG_PATH.exists():
-        CONFIG_ERROR = (
-            f"检测到旧配置文件：{_LEGACY_CONFIG_PATH.name}\n"
-            f"  请重命名为 {CONFIG_PATH.name}（或复制 config.example.json）后再启动"
-        )
-        return
-
     if path.exists():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -122,24 +87,6 @@ def _load_config() -> None:
             CONFIG_ERROR = "config.json 的 port 必须是整数"
             return
 
-    # —— 云端模型字段 ——
-    CLOUD_BASE = str(data.get("base_url", "")).strip().rstrip("/")
-    MODEL_NAME = str(data.get("model", "")).strip()
-    API_KEY = str(data.get("api_key", "")).strip()
-
-    # —— deepseek 网页协议，和上面的 OpenAI 兼容云端分开 ——
-    ds = data.get("deepseek")
-    if isinstance(ds, dict):
-        DEEPSEEK_BASE = str(ds.get("base_url", "")).strip().rstrip("/")
-        suffix = "/api/v0/chat/completion"
-        if DEEPSEEK_BASE.endswith(suffix):
-            DEEPSEEK_BASE = DEEPSEEK_BASE[: -len(suffix)].rstrip("/")
-        DEEPSEEK_API_KEY = str(ds.get("api_key", "")).strip()
-        DEEPSEEK_COOKIE = str(ds.get("cookie", "")).strip()
-        DEEPSEEK_DEVICE_ID = str(ds.get("device_id", "")).strip()
-        if "search_enabled" in ds:
-            DEEPSEEK_SEARCH = bool(ds["search_enabled"])
-
     # —— 搜索 Key（环境变量优先）——
     TAVILY_API_KEY = (
         os.environ.get("TAVILY_API_KEY", "").strip()
@@ -156,20 +103,14 @@ def _load_config() -> None:
                 except (TypeError, ValueError):
                     CONFIG_ERROR = f"config.json 的 server.{key} 必须是整数"
                     return
-                SERVER_EXPLICIT.add(key)
         extra = srv.get("extra_args")
         if isinstance(extra, list):
             SERVER["extra_args"] = [str(x) for x in extra]
-        prism_dir = str(srv.get("prism_bin_dir", "")).strip()
-        if prism_dir:
-            p = Path(prism_dir)
-            PRISM_BIN_DIR = p if p.is_absolute() else (ROOT_DIR / p)
     for env_key, cfg_key in (("CODER_AGENT_NGL", "ngl"), ("CODER_AGENT_CTX", "ctx")):
         val = os.environ.get(env_key, "").strip()
         if val:
             try:
                 SERVER[cfg_key] = int(val)
-                SERVER_EXPLICIT.add(cfg_key)
             except ValueError:
                 pass
 
@@ -183,100 +124,20 @@ def _load_config() -> None:
                 except (TypeError, ValueError):
                     CONFIG_ERROR = f"config.json 的 sampling.{key} 必须是数字"
                     return
-                SAMPLING_EXPLICIT.add(key)
 
-    # —— provider：环境变量 > config.json > local ——
-    env_provider = os.environ.get("CODER_AGENT_PROVIDER", "").strip().lower()
-    file_provider = str(data.get("provider", "")).strip().lower()
-    if env_provider in {"ds-cloud", "deepseek"}:
-        PROVIDER = "cloud"
-        API_STYLE = "deepseek"
-        PROVIDER_FROM_ENV = True
-    elif env_provider in {"local", "cloud"}:
-        PROVIDER = env_provider
-        API_STYLE = "openai"
-        PROVIDER_FROM_ENV = True
-    elif file_provider in {"local", "cloud"}:
-        PROVIDER = file_provider
-    elif file_provider:
-        CONFIG_ERROR = 'config.json 的 provider 只能是 "local" 或 "cloud"'
-        return
-    else:
-        PROVIDER = "local"
-
-    if PROVIDER == "cloud" and API_STYLE == "deepseek":
-        if not DEEPSEEK_BASE:
-            CONFIG_ERROR = (
-                "deepseek 需要 config.json 里的 deepseek.base_url，"
-                "例如 https://chat.deepseek.com"
-            )
-            return
-        BASE = DEEPSEEK_BASE
-    elif PROVIDER == "cloud":
-        if not path.exists():
-            CONFIG_ERROR = (
-                f"未找到配置文件：{CONFIG_PATH}\n"
-                "  请复制 config.example.json 为 config.json 并填好 base_url / model / api_key"
-            )
-            return
-        if not CLOUD_BASE or not MODEL_NAME:
-            CONFIG_ERROR = "config.json 在 cloud 模式下需要同时填写 base_url 与 model"
-            return
-        BASE = CLOUD_BASE
-    else:
-        BASE = f"http://{HOST}:{PORT}"
+    BASE = f"http://{HOST}:{PORT}"
 
 
 _load_config()
-
-# 模型预设改过 SAMPLING 后，切回别的模型要能还原成 config.json 里的值
-SAMPLING_BASE: dict = dict(SAMPLING)
-
-
-def cloud_available() -> bool:
-    """config.json 里是否配好了可用的 OpenAI 兼容云端模型。"""
-    return bool(CLOUD_BASE and MODEL_NAME)
-
-
-def deepseek_available() -> bool:
-    """config.json 里是否配了 deepseek 的地址。"""
-    return bool(DEEPSEEK_BASE)
-
-
-def use_cloud() -> None:
-    """运行时切到 OpenAI 兼容云端模型（菜单选择）。"""
-    global PROVIDER, API_STYLE, BASE
-    PROVIDER = "cloud"
-    API_STYLE = "openai"
-    BASE = CLOUD_BASE
-
-
-def use_deepseek() -> None:
-    """运行时切到 deepseek。"""
-    global PROVIDER, API_STYLE, BASE
-    PROVIDER = "cloud"
-    API_STYLE = "deepseek"
-    BASE = DEEPSEEK_BASE
-    from agent.deepseek import reset_session
-    reset_session()
-
-
-def use_local() -> None:
-    """运行时切到本地 llama-server。"""
-    global PROVIDER, API_STYLE, BASE
-    PROVIDER = "local"
-    API_STYLE = "openai"
-    BASE = f"http://{HOST}:{PORT}"
 
 
 # ========================================================================
 #  运行时状态（会话内可变）
 # ========================================================================
-# 当前模型信息（server.py 启动后填写；云端用 MODEL_NAME）
+# 当前模型信息（server.py 启动后填写）
 MODEL_LABEL = ""  # 横幅/状态栏显示用
 MODEL_PARAMS_B: float | None = None  # 从文件名解析的参数量（B）
 MODEL_N_CTX = 0  # 服务端实际上下文长度；0 = 未知
-DEFAULT_CLOUD_CTX = 128_000
 # 本地模型的思考深度（--reasoning-effort），如 "low"/"medium"/"xhigh"；
 # 空串 = 不传，用模型模板自带的默认档。选模型时按模板支持情况询问后写入。
 REASONING_EFFORT = ""
@@ -287,10 +148,10 @@ VERBOSE = False  # /verbose → 工具结果 / 思考全量显示
 
 
 def n_ctx() -> int:
-    """当前上下文长度（未知时按 provider 给默认值）。"""
+    """当前上下文长度（未知时用 server.fit_ctx）。"""
     if MODEL_N_CTX > 0:
         return MODEL_N_CTX
-    return DEFAULT_CLOUD_CTX if PROVIDER == "cloud" else int(SERVER["fit_ctx"])
+    return int(SERVER["fit_ctx"])
 
 
 # 用户可输入的斜杠命令（不区分大小写，在 main 里处理）
@@ -334,11 +195,9 @@ SLASH_MENU: list[tuple[str, str]] = [
 MAX_TOOL_ROUNDS = 48
 MAX_READ_CHARS = 80_000
 MAX_REASONING_CHARS = 24_000
-DEEPSEEK_MAX_REASONING_CHARS = 48_000
 REASONING_LOOP_MIN_UNIT = 40
 REASONING_LOOP_REPEATS = 5
 MAX_REASONING_ABORTS = 3
-MAX_TOOL_PROTOCOL_RETRIES = 2
 MAX_EMPTY_RESPONSE_RETRIES = 2
 
 # 上下文压缩阈值（占 n_ctx 的比例）

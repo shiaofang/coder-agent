@@ -5,7 +5,7 @@ cd /d "%~dp0"
 REM Model selection, llama-server startup (VRAM auto-fit, mmproj, error output)
 REM and shutdown are all handled inside Python now: see agent/server.py.
 REM Tuning lives in config.json -> "server": { fit_margin, fit_ctx, ngl, ctx, extra_args }.
-REM Environment overrides still work: CODER_AGENT_NGL / CODER_AGENT_CTX / CODER_AGENT_PROVIDER.
+REM Environment overrides still work: CODER_AGENT_NGL / CODER_AGENT_CTX.
 
 where python >nul 2>&1
 if errorlevel 1 (

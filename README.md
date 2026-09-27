@@ -18,7 +18,6 @@
   - [3. 启动](#3-启动)
   - [4. 配置文件 `config.json`](#4-配置文件-configjson)
 - [使用说明](#使用说明)（输入 / 斜杠命令 / 确认 / 上下文 / 工具）
-- [云端模型（可选）](#云端模型可选)
 - [工作原理](#工作原理简要)
 - [常见问题](#常见问题)
 - [安全提示](#安全提示)
@@ -60,7 +59,6 @@ coder-agent/
 │   ├── loop.py            # 多轮工具循环
 │   └── main.py            # 主程序入口
 ├── bin/                   # 本地自备：llama-server 及 DLL（不上传 Git）
-├── bin-prism/             # 可选：PrismML 分支的 llama-server（三值量化模型用）
 ├── models/                # 本地自备：*.gguf 模型（不上传 Git）
 ├── sessions/              # 自动保存的会话（不上传 Git）
 └── README.md
@@ -165,44 +163,15 @@ models/Qwen3.5-9B-Q4_K_M.mmproj.gguf
 
 名字不匹配时启动会问你要不要启用（默认不启用；projector 只能配它自己那个模型）。
 
-#### 三值量化模型（Bonsai，可选）
+本项目只认官方 llama.cpp 能加载的标准 GGUF。文件名带 `PTQ1_0` / `PQ2_0` 的三值/二值量化权重会被跳过，请不要放进 `models/`。
 
-[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-这类权重（文件名带 `PTQ1_0` / `PQ2_0`）用的是自定义三值量化，**官方 llama.cpp 加载会直接报
-`invalid ggml type 143` 退出**，必须用 PrismML 分支编出的 `llama-server`。
-
-本项目支持两套运行时并存：把 PrismML 分支的 `llama-server` 及其 DLL 放进 `bin-prism/`，
-选到这类模型时自动切过去，其余模型继续用 `bin/`。目录放别处时在 `config.json` 里写
-`server.prism_bin_dir`。缺这份构建时，模型列表会标注「缺 Prism 运行时」并在启动前直接报错，
-不会白等一次加载。
-
-拿二进制的两种方式（[releases](https://github.com/PrismML-Eng/llama.cpp/releases/latest)）：
-
-- **下预编译包**：按 `bin/` 同样的规则挑，N 卡选 `llama-prism-*-bin-win-cuda-12.4-x64.zip`
-  并额外下同版本 `cudart-llama-bin-win-cuda-12.4-x64.zip`，两个包的内容一起解压进 `bin-prism/` 根目录
-- **自己编**：`git clone -b prism https://github.com/PrismML-Eng/llama.cpp` 后
-  `cmake -B build -DGGML_CUDA=ON && cmake --build build -j`，把 `build/bin/` 的产物拷进 `bin-prism/`
-
-分支的基线 commit 和官方版不一定一致，启动前会先读一次 `llama-server --help`，
-只传它认识的参数（`--jinja` / `--tools` / `-fitt`），缺哪个就自动退回 `-ngl 99 -c <fit_ctx>`。
-
-选到这类模型时会自动套一套 6 GB 卡实测参数，**`config.json` 里显式写过的键不会被覆盖**：
-
-| 预设 | 为什么 |
-|------|--------|
-| `-ngl 99` | 权重 5.95 GB 必须整体在 GPU 上。交给 `--fit` 自适应会把层挤回 CPU，实测从 3.9 tok/s 掉到 0.4 以下 |
-| `-nkvo` + `-ctk q4_0` `-ctv q4_0` | 显存已被权重占满，KV cache 放内存并压到 q4_0，否则上下文一大就 OOM |
-| `-fa on`、`--context-shift` | Flash Attention 省 KV 显存；上下文满了滚动而不是报错 |
-| `temp 1.0` / `top_p 0.95` / `top_k 20` / `repeat_penalty 1.1` | Bonsai（Qwen3 系）官方推荐采样值 |
-| `ctx 65536` | 只在 `config.json` 没写 `server.ctx` 时生效 |
-
-RTX 2060 6GB 上的实测：加载约 10 秒，生成约 4 tok/s。能用但慢，适合让它慢慢改一个文件，
-不适合长对话来回。
+启动前会先读一次 `llama-server --help`，只传它认识的参数（`--jinja` / `--tools` / `-fitt`），
+缺哪个就自动退回 `-ngl 99 -c <fit_ctx>`。
 
 #### 思考深度
 
 选模型的表格里有「思考深度」一列。程序会读 GGUF 里的 chat template 判断该模型是否支持
-`reasoning_effort`：支持就列出可选档位（如 Bonsai 的 低/中/极高），选完模型再问一次深度，
+`reasoning_effort`：支持就列出可选档位（如 低/中/极高），选完模型再问一次深度，
 按 `--reasoning-effort` 传给服务；只有思考开关（`enable_thinking`）没有分档的模型显示 `-`，
 不会追问。档位白名单直接从模板里解析，不会传模型不认的值。回车 = 用模型模板自带的默认档。
 
@@ -215,7 +184,7 @@ start.bat
 流程：
 
 1. 检查 Python 与依赖（缺 `rich` / `prompt_toolkit` / `playwright` 时自动 `pip install`）
-2. 列出 `models/` 下的 GGUF（大小、参数量、是否带视觉），回车 = 上次用的模型；配了云端时也会列出
+2. 列出 `models/` 下的 GGUF（大小、参数量、是否带视觉），回车 = 上次用的模型
 3. 后台拉起 `llama-server`，加载进度实时显示；失败时直接打印日志尾部与原因（显存不足 / 端口占用 / 文件损坏）
 4. 进入对话；退出时自动关闭服务
 
@@ -229,12 +198,8 @@ copy config.example.json config.json
 
 ```json
 {
-  "provider": "local",
   "host": "127.0.0.1",
   "port": 8080,
-  "base_url": "",
-  "model": "",
-  "api_key": "",
   "tavily_api_key": "",
   "server":   { "fit_margin": 384, "fit_ctx": 16384, "ngl": null, "ctx": null, "extra_args": [] },
   "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat_penalty": null }
@@ -243,15 +208,12 @@ copy config.example.json config.json
 
 | 字段 | 说明 |
 |------|------|
-| `provider` | `local` / `cloud`；启动菜单里可临时选另一个。环境变量 `CODER_AGENT_PROVIDER` 可强制并跳过菜单 |
 | `host` / `port` | 本地 llama-server 监听地址 |
-| `base_url` / `model` / `api_key` | 云端 OpenAI 兼容接口（`base_url` 不带 `/v1`）；填了才会在菜单里出现「云端」 |
 | `tavily_api_key` | [Tavily](https://app.tavily.com) 搜索 Key（或环境变量 `TAVILY_API_KEY`）。**没配时不会把 `web_search` / `fetch_url` 暴露给模型**，省 token 也免报错 |
 | `server.fit_margin` | 自适应显存时预留给桌面的 MiB（`-fitt`）。留太多会把层挤到 CPU 变慢 |
 | `server.fit_ctx` | 自适应允许的最小上下文（`-fitc`）。系统提示 + 工具声明约 2k token，别低于 8192 |
 | `server.ngl` / `server.ctx` | 手动写死 `-ngl` / `-c`（写了就不再自适应）；环境变量 `CODER_AGENT_NGL` / `CODER_AGENT_CTX` 优先 |
 | `server.extra_args` | 追加给 llama-server 的其它参数 |
-| `server.prism_bin_dir` | 三值量化（`PTQ1_0`/`PQ2_0`）模型用的 PrismML `llama-server` 目录，留空 = `bin-prism/` |
 | `sampling.*` | 采样参数，非空字段才发给模型。示例值是 Qwen3 系列推荐 |
 
 6GB RTX 2060 + 9B Q4_K_M 实测 `fit_margin`：`1024` → 4.3 GB / 9 tok/s；`384` → 5.0 GB / 14 tok/s；`128` → 5.3 GB / 17 tok/s。
@@ -277,7 +239,7 @@ copy config.example.json config.json
 
 | 命令 | 作用 |
 |------|------|
-| `/model` | 换本地 GGUF（或切到云端），对话历史保留 |
+| `/model` | 换本地 GGUF，对话历史保留 |
 | `/ctx` | 查看上下文用量条与消息统计 |
 | `/compact` | 折叠旧工具结果 + 让模型总结旧对话，腾出上下文 |
 | `/think on\|off` | 开关模型思考（Qwen3 系列通过 `enable_thinking`）；简单任务关掉更快 |
@@ -327,28 +289,15 @@ copy config.example.json config.json
 
 启动、`/cd`、`/model` 时会把当前目录的项目上下文注入 system 提示（`AGENTS.md` / `.cursorrules`、`package.json` scripts、git status、README 节选），注入上限随模型上下文长度缩放。
 
-## 云端模型（可选）
-
-在 `config.json` 填好 `base_url` / `model` / `api_key` 后，启动菜单会多一项「云端」。常见场景：
-
-| 场景 | `base_url` | `model` | `api_key` |
-|------|-----------|---------|-----------|
-| 本机 Ollama 转发云端模型 | `http://127.0.0.1:11434` | `gpt-oss:120b-cloud` | 留空 |
-| 直连 Ollama 云端 | `https://ollama.com` | `gpt-oss:120b-cloud` | [ollama.com/settings/keys](https://ollama.com/settings/keys) |
-| OpenAI | `https://api.openai.com` | `gpt-4o` 等 | OpenAI API Key |
-
-要跳过菜单直接进云端：`set CODER_AGENT_PROVIDER=cloud` 后 `python chat.py`。
-
 ## 常见问题
 
 | 现象 | 原因 / 处理 |
 |------|-------------|
 | 双击 `start.bat` 窗口一闪而过，什么都没有 | 多半是 Python 没装或没加进 PATH。在命令行 `python --version` 确认；也可以在窗口里手动 `python chat.py` 看报错 |
 | 提示找不到 `xxx.dll` / `llama-server` 闪退 | `bin/` 的 DLL 没拷全。重看 [1.3](#13-放好后-bin-里应该有什么)，CUDA 版记得连 `cudart-*` 包一起解压 |
-| 模型加载失败，日志里有 `invalid ggml type` | 该量化档这份 `llama-server` 不认识。三值量化模型要用 `bin-prism/` 里的 PrismML 构建；其它情况多半是 `bin/` 版本过旧，重下新版 |
+| 模型加载失败，日志里有 `invalid ggml type` | 该量化档这份 `llama-server` 不认识。换标准 GGUF，或把 `bin/` 升到较新的官方构建 |
 | 模型加载失败，日志里有 `out of memory` | 显存不够。调小 `config.json` 的 `server.fit_ctx`（如 `8192`），或调大 `server.fit_margin` |
 | 起来了但很慢（个位数 tok/s） | GPU 放不下、层落到了 CPU。换更小的量化档（Q4）、调小上下文，或用参数量更小的模型 |
-| `HTTP 401 Unauthorized`（云端） | `config.json` 的 `api_key` 无效或过期，去对应平台重新生成 |
 | 模型不调用工具 / 只会聊天 | 该 GGUF 不支持 tool calling，换支持的模型（如 Qwen3.5 系列） |
 | `web_search` 用不了 | 没配 `tavily_api_key`；不配的话这个工具根本不会出现，属正常 |
 

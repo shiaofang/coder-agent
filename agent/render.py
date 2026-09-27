@@ -135,7 +135,7 @@ class StreamRenderer:
         self._stop_live()
         full = "".join(self._reasoning)
         secs = time.time() - self._think_started
-        show_body = config.VERBOSE or config.API_STYLE == "deepseek"
+        show_body = config.VERBOSE
         if show_body and full.strip():
             console.print(Text("∴ 深度思考", style="magenta"))
             console.print(Text("\n".join("  " + ln for ln in full.strip().splitlines()), style="dim italic"))
@@ -454,24 +454,19 @@ def show_banner(cwd: str) -> None:
     """启动横幅：模型 · 上下文 · 工作目录 · 常用命令。"""
     from rich.panel import Panel
 
-    model = config.MODEL_LABEL or config.MODEL_NAME or "(未知模型)"
+    model = config.MODEL_LABEL or "(未知模型)"
     n_ctx = config.n_ctx()
     lines = Text()
     lines.append("✻ Coder Agent\n", style="bold green")
     lines.append("本地终端编程助手，直接读文件、改代码、跑命令\n\n", style="dim")
     lines.append("模型  ", style="dim")
     lines.append(f"{model}", style="cyan")
-    if config.API_STYLE == "deepseek":
-        lines.append("  (deepseek)", style="dim")
-    elif config.PROVIDER == "cloud":
-        lines.append("  (云端)", style="dim")
-    else:
-        lines.append(f"  ctx {_fmt_k(n_ctx)}", style="dim")
-        if config.MODEL_PARAMS_B:
-            lines.append(f"  {config.MODEL_PARAMS_B:g}B", style="dim")
-        lines.append("\n网页  ", style="dim")
-        lines.append(f"http://{config.HOST}:{config.PORT}", style="blue underline")
-        lines.append("  (llama-server 自带聊天界面)", style="dim")
+    lines.append(f"  ctx {_fmt_k(n_ctx)}", style="dim")
+    if config.MODEL_PARAMS_B:
+        lines.append(f"  {config.MODEL_PARAMS_B:g}B", style="dim")
+    lines.append("\n网页  ", style="dim")
+    lines.append(f"http://{config.HOST}:{config.PORT}", style="blue underline")
+    lines.append("  (llama-server 自带聊天界面)", style="dim")
     lines.append("\n目录  ", style="dim")
     lines.append(cwd, style="blue")
     lines.append("\n\n")

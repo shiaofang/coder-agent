@@ -1,19 +1,6 @@
 {
-  "provider": "local",
   "host": "127.0.0.1",
   "port": 8080,
-
-  "base_url": "",
-  "model": "",
-  "api_key": "",
-
-  "deepseek": {
-    "base_url": "https://chat.deepseek.com",
-    "api_key": "",
-    "cookie": "",
-    "device_id": "",
-    "search_enabled": false
-  },
 
   "tavily_api_key": "",
 
@@ -22,8 +9,7 @@
     "fit_ctx": 16384,
     "ngl": null,
     "ctx": null,
-    "extra_args": [],
-    "prism_bin_dir": ""
+    "extra_args": []
   },
 
   "sampling": {

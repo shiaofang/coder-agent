@@ -23,20 +23,8 @@ from agent import config
 from agent.render import console, error, info, warn
 
 _PARAMS_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])")
-# Bonsai 系列的三值/二值量化标记；官方 llama.cpp 读到这些张量会报 invalid ggml type
-_TERNARY_QUANT_RE = re.compile(r"(?:^|[-_.])(PTQ1_0|PQ2_0)(?:[-_.]|$)", re.I)
-_MODEL_CARD_URL = "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf"
-
-# 三值 Bonsai 在 6GB 卡（RTX 2060）上实测可用的一套参数。
-# 权重本身就有 5.95GB，几乎占满显存，所以：层全部上 GPU（--fit 会把层挤回 CPU 变很慢），
-# KV cache 留在内存（-nkvo）并压成 q4_0，否则上下文一大就 OOM。
-# 采样值用 Bonsai/Qwen3 官方推荐；config.json 里显式写过的键不会被这里覆盖。
-_PRISM_PROFILE: dict = {
-    "ngl": 99,
-    "ctx": 65536,
-    "flags": [["-fa", "on"], ["-nkvo"], ["-ctk", "q4_0"], ["-ctv", "q4_0"], ["--context-shift"]],
-    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "repeat_penalty": 1.1},
-}
+# 三值/二值自定义量化（官方 llama.cpp 不认识）；本项目不支持，列模型时跳过
+_UNSUPPORTED_QUANT_RE = re.compile(r"(?:^|[-_.])(PTQ1_0|PQ2_0)(?:[-_.]|$)", re.I)
 _LOG_TAIL = 60
 _HEALTH_TIMEOUT_S = 600  # 大模型 / 慢盘加载可能很久
 
@@ -156,11 +144,6 @@ class ModelInfo:
         return self.path.name
 
     @property
-    def needs_prism_runtime(self) -> bool:
-        """三值量化权重只有 PrismML 分支的 llama-server 能加载。"""
-        return bool(_TERNARY_QUANT_RE.search(self.path.stem))
-
-    @property
     def reasoning_levels(self) -> list[str]:
         return reasoning_levels(self.path)
 
@@ -193,6 +176,8 @@ def list_models() -> list[ModelInfo]:
     for p in sorted(config.MODEL_DIR.glob("*.gguf"), key=lambda x: x.name.lower()):
         if "mmproj" in p.name.lower():
             continue
+        if _UNSUPPORTED_QUANT_RE.search(p.stem):
+            continue  # 三值/二值量化，官方 llama-server 无法加载
         stem = p.with_suffix("")
         mm = Path(str(stem) + ".mmproj.gguf")
         out.append(
@@ -226,14 +211,12 @@ def _write_last_model(name: str) -> None:
         pass
 
 
-def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInfo | str | None:
-    """交互选择。返回 ModelInfo / "cloud" / "ds-cloud" / "attach" / None（取消）。"""
+def pick_model(allow_attach: bool = False) -> ModelInfo | str | None:
+    """交互选择。返回 ModelInfo / "attach" / None（取消）。"""
     models = list_models()
-    show_cloud = allow_cloud and config.cloud_available()
-    show_ds = allow_cloud and config.deepseek_available()
-    if not models and not show_cloud and not show_ds and not allow_attach:
-        error("models\\ 下没有 .gguf 文件，config.json 也没配云端模型")
-        console.print("  [dim]本地：把 GGUF 放进 models\\ ；云端：填 base_url / model；deepseek：填 deepseek.base_url[/]")
+    if not models and not allow_attach:
+        error("models\\ 下没有 .gguf 文件")
+        console.print("  [dim]把支持 tool calling 的 GGUF 放进 models\\ 后再启动[/]")
         return None
 
     last = _read_last_model()
@@ -245,15 +228,11 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
     table.add_column("参数", justify="right", style="dim")
     table.add_column("视觉", style="dim")
     table.add_column("思考深度", style="dim")
-    missing_prism = False
     for i, m in enumerate(models, 1):
         mark = ""
         if m.name == last:
             default_idx = i
             mark = " [dim](上次)[/]"
-        if m.needs_prism_runtime and resolve_exe(m) is None:
-            missing_prism = True
-            mark += " [yellow](缺 Prism 运行时)[/]"
         levels = m.reasoning_levels
         depth = "/".join(_EFFORT_LABELS.get(x, x) for x in levels) if levels else "-"
         table.add_row(
@@ -265,22 +244,7 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
             depth,
         )
     extra_idx = len(models)
-    cloud_idx = ds_idx = attach_idx = 0
-    if show_cloud:
-        extra_idx += 1
-        cloud_idx = extra_idx
-        mark = " [dim](上次)[/]" if last == "cloud" else ""
-        # 上次用的是云端，或没有记录但 config.json 写的是 provider=cloud → 默认选云端
-        if last == "cloud" or (not last and config.PROVIDER == "cloud" and config.API_STYLE != "deepseek"):
-            default_idx = cloud_idx
-        table.add_row(str(cloud_idx), f"☁ 云端 {config.MODEL_NAME}{mark}", "", "", "", "")
-    if show_ds:
-        extra_idx += 1
-        ds_idx = extra_idx
-        mark = " [dim](上次)[/]" if last in {"ds-cloud", "deepseek"} else ""
-        if last in {"ds-cloud", "deepseek"} or (not last and config.API_STYLE == "deepseek"):
-            default_idx = ds_idx
-        table.add_row(str(ds_idx), f"☁ deepseek{mark}", "", "", "", "")
+    attach_idx = 0
     if allow_attach:
         extra_idx += 1
         attach_idx = extra_idx
@@ -289,9 +253,6 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
     console.print()
     console.print("[bold]选择模型[/]")
     console.print(table)
-    if missing_prism:
-        console.print(f"  [dim]三值量化（PTQ1_0/PQ2_0）需把 PrismML 分支的 llama-server 放进 "
-                      f"{config.PRISM_BIN_DIR.name}\\ ，官方 bin\\ 加载不了[/]")
     while True:
         try:
             raw = console.input(f"[dim]输入序号 [1-{extra_idx}]，回车 = {default_idx}: [/]").strip()
@@ -308,12 +269,6 @@ def pick_model(allow_cloud: bool = True, allow_attach: bool = False) -> ModelInf
         if not 1 <= choice <= extra_idx:
             warn(f"超出范围，输入 1-{extra_idx}")
             continue
-        if cloud_idx and choice == cloud_idx:
-            _write_last_model("cloud")
-            return "cloud"
-        if ds_idx and choice == ds_idx:
-            _write_last_model("deepseek")
-            return "ds-cloud"
         if choice == attach_idx:
             return "attach"
         m = models[choice - 1]
@@ -392,13 +347,8 @@ def _exe_in(dir_path: Path) -> Path:
     return dir_path / ("llama-server.exe" if os.name == "nt" else "llama-server")
 
 
-def resolve_exe(model: ModelInfo) -> Path | None:
-    """挑选该模型该用哪个 llama-server：三值量化优先用 bin-prism\\，其余用 bin\\。"""
-    if model.needs_prism_runtime:
-        prism = _exe_in(config.PRISM_BIN_DIR)
-        if prism.is_file():
-            return prism
-        return None
+def resolve_exe() -> Path | None:
+    """官方 llama-server：固定用 bin\\。"""
     exe = _exe_in(config.BIN_DIR)
     return exe if exe.is_file() else None
 
@@ -407,10 +357,7 @@ _help_cache: dict[str, str] = {}
 
 
 def _help_text(exe: Path) -> str:
-    """缓存 `llama-server --help`，用来判断这份二进制支持哪些参数。
-
-    不同分支（官方 / PrismML）基线 commit 不同，直接传不认识的参数会让服务启动即退出。
-    """
+    """缓存 `llama-server --help`，用来判断这份二进制支持哪些参数。"""
     key = str(exe)
     if key not in _help_cache:
         try:
@@ -432,35 +379,6 @@ def _kill_stale() -> None:
         subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"], capture_output=True)
     else:
         subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
-
-
-def _profile_for(model: ModelInfo) -> dict | None:
-    return _PRISM_PROFILE if model.needs_prism_runtime else None
-
-
-def _effective_server(model: ModelInfo) -> dict:
-    """本次启动实际用的 server 参数：config.json 为准，预设只补没写过的键。"""
-    srv = dict(config.SERVER)
-    prof = _profile_for(model)
-    if prof:
-        for key in ("ngl", "ctx"):
-            if key not in config.SERVER_EXPLICIT:
-                srv[key] = prof[key]
-    return srv
-
-
-def _apply_sampling_profile(model: ModelInfo) -> list[str]:
-    """把预设采样值写进 config.SAMPLING（切模型时先还原成 config.json 的值）。"""
-    config.SAMPLING.update(config.SAMPLING_BASE)
-    prof = _profile_for(model)
-    if not prof:
-        return []
-    applied = []
-    for key, val in prof["sampling"].items():
-        if key not in config.SAMPLING_EXPLICIT:
-            config.SAMPLING[key] = val
-            applied.append(f"{key}={val:g}")
-    return applied
 
 
 def _build_cmd(model: ModelInfo, mmproj: Path | None, exe: Path, srv: dict) -> list[str]:
@@ -493,14 +411,7 @@ def _build_cmd(model: ModelInfo, mmproj: Path | None, exe: Path, srv: dict) -> l
                 cmd += ["-c", str(srv["fit_ctx"])]
     if mmproj:
         cmd += ["--mmproj", str(mmproj)]
-    extra = list(srv.get("extra_args") or [])
-    prof = _profile_for(model)
-    if prof:
-        # 自己在 extra_args 里写过同名参数时以用户的为准
-        for group in prof["flags"]:
-            if group[0] not in extra and _supports(exe, group[0]):
-                cmd += group
-    cmd += extra
+    cmd += list(srv.get("extra_args") or [])
     return cmd
 
 
@@ -537,24 +448,15 @@ def _resolve_mmproj(model: ModelInfo) -> Path | None:
 
 def start(model: ModelInfo) -> bool:
     """启动 llama-server 并等待 /health 就绪。失败时把日志尾部打出来。"""
-    exe = resolve_exe(model)
+    exe = resolve_exe()
     if exe is None:
-        if model.needs_prism_runtime:
-            error(f"{model.name} 是三值量化权重，官方 llama.cpp 加载会报 invalid ggml type")
-            console.print(
-                f"  [dim]请把 PrismML 分支编出的 llama-server（含同目录 dll）放到 "
-                f"{config.PRISM_BIN_DIR}\\ ，或在 config.json 里设 server.prism_bin_dir 指向它[/]"
-            )
-            console.print(f"  [dim]构建/下载说明见模型卡片：[/][blue underline]{_MODEL_CARD_URL}[/]")
-        else:
-            error(f"找不到 {_exe_in(config.BIN_DIR)}")
+        error(f"找不到 {_exe_in(config.BIN_DIR)}")
         return False
 
     stop()
     _kill_stale()
     mmproj = _resolve_mmproj(model)
-    srv = _effective_server(model)
-    samp = _apply_sampling_profile(model)
+    srv = dict(config.SERVER)
     cmd = _build_cmd(model, mmproj, exe, srv)
 
     creationflags = 0
@@ -584,11 +486,7 @@ def start(model: ModelInfo) -> bool:
 
     tune = "自适应显存" if srv.get("ngl") is None and srv.get("ctx") is None else \
         f"ngl={srv.get('ngl')} ctx={srv.get('ctx')}"
-    runtime = f", 运行时 {exe.parent.name}\\" if exe.parent != config.BIN_DIR else ""
-    console.print(f"[dim]启动 llama-server：{model.name}  ({tune}{runtime}{', 视觉 on' if mmproj else ''})[/]")
-    if _profile_for(model):
-        detail = "KV 留内存 + q4_0" + (f"，采样 {' '.join(samp)}" if samp else "")
-        console.print(f"  [dim]已套用三值模型预设：{detail}（config.json 里写过的值不会被覆盖）[/]")
+    console.print(f"[dim]启动 llama-server：{model.name}  ({tune}{', 视觉 on' if mmproj else ''})[/]")
     if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
         cn = _EFFORT_LABELS.get(config.REASONING_EFFORT, config.REASONING_EFFORT)
         console.print(f"  [dim]思考深度：{cn}（--reasoning-effort {config.REASONING_EFFORT}）[/]")
@@ -633,8 +531,7 @@ def _print_log_tail(n: int = 25) -> None:
 def _print_hints() -> None:
     text = "\n".join(_state.log).lower()
     if "invalid ggml type" in text:
-        warn("这份 llama-server 不认识该量化类型：三值量化（PTQ1_0/PQ2_0）需要 PrismML 分支的构建")
-        console.print(f"  [dim]把它放到 {config.PRISM_BIN_DIR}\\ ；说明见 {_MODEL_CARD_URL}[/]")
+        warn("这份 llama-server 不认识该量化类型：换标准 GGUF，或升级 bin\\ 到较新的官方构建")
     elif "invalid argument" in text or "unknown argument" in text or "error while handling argument" in text:
         warn("启动参数不被这份 llama-server 支持：检查 config.json 的 server.extra_args")
     elif "out of memory" in text or "cuda" in text and "failed" in text:
@@ -675,78 +572,26 @@ def current_model() -> ModelInfo | None:
 #  启动流程 / 切换
 # ------------------------------------------------------------------------
 
-def _activate_ds_cloud() -> bool:
-    if not config.deepseek_available():
-        error("config.json 缺 deepseek.base_url，无法使用 deepseek")
-        return False
-    config.use_deepseek()
-    config.THINKING = True
-    config.MODEL_LABEL = "deepseek"
-    config.MODEL_PARAMS_B = None
-    config.MODEL_N_CTX = 0
-    return True
-
-
 def ensure_backend() -> bool:
-    """程序启动时：决定用云端还是本地；本地则选模型并启动。返回是否就绪。"""
-    if config.PROVIDER_FROM_ENV and config.API_STYLE == "deepseek":
-        return _activate_ds_cloud()
-    if config.PROVIDER == "cloud" and config.PROVIDER_FROM_ENV:
-        config.MODEL_LABEL = config.MODEL_NAME
-        return True
-
+    """程序启动时：选本地 GGUF 并启动 llama-server。返回是否就绪。"""
     already = is_healthy()
-    if config.PROVIDER_FROM_ENV and config.PROVIDER == "local" and already:
-        # start.bat / 手动起好的服务：直接用
-        apply_props()
-        return True
-
-    choice = pick_model(allow_cloud=not config.PROVIDER_FROM_ENV, allow_attach=already)
+    choice = pick_model(allow_attach=already)
     if choice is None:
         return False
-    if choice == "cloud":
-        if not config.cloud_available():
-            error("config.json 缺 base_url / model，无法使用云端")
-            return False
-        config.use_cloud()
-        config.MODEL_LABEL = config.MODEL_NAME
-        return True
-    if choice == "ds-cloud":
-        return _activate_ds_cloud()
     if choice == "attach":
-        config.use_local()
         apply_props()
         return True
-    config.use_local()
     return start(choice)
 
 
 def switch_model() -> bool:
     """/model：重新选一个本地 GGUF 并重启服务。失败时保留旧服务（若仍在）。"""
-    choice = pick_model(
-        allow_cloud=config.cloud_available() or config.deepseek_available(),
-        allow_attach=False,
-    )
+    choice = pick_model(allow_attach=False)
     if choice is None:
         return False
-    if choice == "cloud":
-        stop()
-        config.use_cloud()
-        config.MODEL_LABEL = config.MODEL_NAME
-        config.MODEL_PARAMS_B = None
-        config.MODEL_N_CTX = 0
-        info(f"已切换到云端模型 {config.MODEL_NAME}")
-        return True
-    if choice == "ds-cloud":
-        stop()
-        if not _activate_ds_cloud():
-            return False
-        info("已切换到 deepseek")
-        return True
     if _state.model is not None and choice.path == _state.model.path and is_healthy():
         info("已经是当前模型")
         return True
-    config.use_local()
     config.MODEL_LABEL = ""
     config.MODEL_N_CTX = 0
     return start(choice)

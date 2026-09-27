@@ -16,16 +16,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from agent import config
-from agent.deepseek import (
-    ContentFilter,
-    complete_plain,
-    has_tool_call_markup,
-    parse_tool_calls,
-    reset_session as reset_deepseek_session,
-    stream_chat,
-)
 from agent.config import (
-    DEEPSEEK_MAX_REASONING_CHARS,
     MAX_REASONING_CHARS,
     REASONING_LOOP_MIN_UNIT,
     REASONING_LOOP_REPEATS,
@@ -41,16 +32,8 @@ class ChatResult:
     reasoning: str = ""
     looped: bool = False
     loop_reason: str = ""
-    tool_protocol_error: str = ""
     # 服务端统计：prompt_n / predicted_n / predicted_per_second（llama-server timings）
     stats: dict = field(default_factory=dict)
-
-
-def _auth_headers(base: dict[str, str]) -> dict[str, str]:
-    """云端模式下附带 Authorization: Bearer <api_key>；本地模式不加。"""
-    if config.PROVIDER == "cloud" and config.API_KEY:
-        return {**base, "Authorization": f"Bearer {config.API_KEY}"}
-    return base
 
 
 def request_json(method: str, path: str, body: dict | None = None, timeout: float = 600.0):
@@ -60,16 +43,14 @@ def request_json(method: str, path: str, body: dict | None = None, timeout: floa
         f"{config.BASE}{path}",
         data=data,
         method=method,
-        headers=_auth_headers({"Content-Type": "application/json", "Accept": "application/json"}),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def wait_ready(retries: int = 120) -> bool:
-    """轮询 /health 等模型服务就绪（本地由 server.py 负责启动；云端直接视为就绪）。"""
-    if config.PROVIDER == "cloud":
-        return True
+    """轮询 /health 等模型服务就绪（由 server.py 负责启动）。"""
     with console.status("[dim]等待模型服务…[/]", spinner="dots"):
         for _ in range(retries):
             try:
@@ -117,8 +98,6 @@ def _base_payload(messages: list[dict]) -> dict:
     for key, val in config.SAMPLING.items():
         if val is not None:
             payload[key] = val
-    if config.MODEL_NAME and config.PROVIDER == "cloud":
-        payload["model"] = config.MODEL_NAME
     if not config.THINKING:
         # Qwen3 系列等：通过 chat template 关闭思考
         payload["chat_template_kwargs"] = {"enable_thinking": False}
@@ -141,76 +120,8 @@ def _extract_stats(obj: dict, stats: dict) -> None:
             stats["predicted_n"] = usage["completion_tokens"]
 
 
-def _chat_once_deepseek(messages: list[dict]) -> ChatResult:
-    """DeepSeek 网页协议：流式返回，把 DSML 调用还原成 OpenAI tool_calls。"""
-    result = ChatResult()
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    filt = ContentFilter()
-    announced_tools = False
-    reasoning_len_at_last_check = 0
-
-    renderer = StreamRenderer("深度思考中…" if config.THINKING else "Working…")
-    renderer.start()
-    stream = stream_chat(messages)
-    try:
-        for piece in stream:
-            if piece.usage is not None:
-                result.stats["accumulated_token_usage"] = piece.usage
-            if piece.reasoning:
-                renderer.on_reasoning(piece.reasoning)
-                reasoning_parts.append(piece.reasoning)
-                total_reasoning_len = sum(len(part) for part in reasoning_parts)
-                if total_reasoning_len > DEEPSEEK_MAX_REASONING_CHARS:
-                    result.looped = True
-                    result.loop_reason = "length"
-                elif total_reasoning_len - reasoning_len_at_last_check >= 150:
-                    reasoning_len_at_last_check = total_reasoning_len
-                    if _detect_reasoning_loop("".join(reasoning_parts)):
-                        result.looped = True
-                        result.loop_reason = "repeat"
-                if result.looped:
-                    renderer.abort()
-                    _warn_reasoning_abort(result.loop_reason, total_reasoning_len)
-                    break
-            if piece.content:
-                content_parts.append(piece.content)
-                visible = filt.feed(piece.content)
-                if visible:
-                    renderer.on_content(visible)
-                if filt.seen_tool and not announced_tools:
-                    announced_tools = True
-                    renderer.on_tool_calls()
-    except BaseException:
-        renderer.abort()
-        raise
-    finally:
-        if result.looped:
-            # 主动断流后服务端可能仍把消息标记为 WIP；旧会话不可继续复用。
-            stream.close()
-            reset_deepseek_session()
-    trailing = filt.flush()
-    if trailing:
-        renderer.on_content(trailing)
-    renderer.finish()
-
-    visible, tools = parse_tool_calls("".join(content_parts))
-    if result.looped:
-        tools = []
-    elif has_tool_call_markup(visible):
-        tools = []
-        visible = ""
-        result.tool_protocol_error = "DeepSeek 返回的工具调用标记不完整或参数标签不合法"
-    result.content = visible
-    result.tool_calls = tools
-    result.reasoning = "".join(reasoning_parts)
-    return result
-
-
 def chat_once(messages: list[dict]) -> ChatResult:
     """One model turn: 流式渲染到终端，返回内容 / tool_calls / 思考 / 统计。"""
-    if config.API_STYLE == "deepseek":
-        return _chat_once_deepseek(messages)
     payload = _base_payload(messages)
     payload["tools"] = get_tools()
     payload["tool_choice"] = "auto"
@@ -220,7 +131,7 @@ def chat_once(messages: list[dict]) -> ChatResult:
         f"{config.BASE}/v1/chat/completions",
         data=data,
         method="POST",
-        headers=_auth_headers({"Content-Type": "application/json", "Accept": "text/event-stream"}),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
 
     result = ChatResult()
@@ -320,8 +231,6 @@ def chat_once(messages: list[dict]) -> ChatResult:
 
 def chat_plain(messages: list[dict], max_tokens: int = 1200) -> str:
     """不带工具、不渲染的一次请求（上下文压缩摘要用）。返回纯文本。"""
-    if config.API_STYLE == "deepseek":
-        return complete_plain(messages)
     payload = _base_payload(messages)
     payload["stream"] = False
     payload["max_tokens"] = max_tokens
