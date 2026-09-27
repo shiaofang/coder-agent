@@ -1,4 +1,1 @@
 rich>=13.0
-prompt_toolkit>=3.0
-playwright>=1.40
-wasmtime>=49

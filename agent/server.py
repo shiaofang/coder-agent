@@ -441,6 +441,134 @@ def _kill_stale() -> None:
         subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
 
 
+def _pids_listening_on_port(port: int) -> list[int]:
+    """返回正在 LISTENING 占用指定端口的 PID 列表。"""
+    pids: set[int] = set()
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+        except Exception:
+            return []
+        for line in r.stdout.splitlines():
+            if "LISTENING" not in line.upper():
+                continue
+            # 例: TCP  127.0.0.1:8080  0.0.0.0:0  LISTENING  12345
+            parts = line.split()
+            if len(parts) < 5 or parts[0].upper() not in {"TCP", "UDP"}:
+                continue
+            local = parts[1]
+            try:
+                if local.startswith("["):
+                    # [::1]:8080
+                    idx = local.rfind("]:")
+                    if idx < 0 or int(local[idx + 2 :]) != port:
+                        continue
+                else:
+                    _, _, p = local.rpartition(":")
+                    if int(p) != port:
+                        continue
+                pids.add(int(parts[-1]))
+            except ValueError:
+                continue
+    else:
+        for cmd in (
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            ["ss", "-lptn", f"sport = :{port}"],
+        ):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            except Exception:
+                continue
+            if cmd[0] == "lsof" and r.returncode == 0:
+                for tok in r.stdout.split():
+                    if tok.isdigit():
+                        pids.add(int(tok))
+                if pids:
+                    break
+            if cmd[0] == "ss" and r.stdout:
+                for m in re.finditer(r"pid=(\d+)", r.stdout):
+                    pids.add(int(m.group(1)))
+                if pids:
+                    break
+    # 不要杀自己
+    me = os.getpid()
+    return sorted(p for p in pids if p != me and p > 0)
+
+
+def _proc_name(pid: int) -> str:
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            line = (r.stdout or "").strip().splitlines()
+            if line and line[0].startswith('"'):
+                return line[0].split('","')[0].strip('"')
+        except Exception:
+            pass
+    else:
+        try:
+            r = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            name = (r.stdout or "").strip()
+            if name:
+                return name
+        except Exception:
+            pass
+    return "?"
+
+
+def clear_port(port: int | None = None) -> bool:
+    """若端口被占用则结束占用进程；释放成功返回 True，失败返回 False。"""
+    port = config.PORT if port is None else port
+    pids = _pids_listening_on_port(port)
+    if not pids:
+        return True
+
+    console.print(f"  [dim]端口 {port} 被占用，正在结束占用进程…[/]")
+    for pid in pids:
+        name = _proc_name(pid)
+        console.print(f"  [dim]  PID {pid} ({name})[/]")
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=15,
+                )
+            else:
+                os.kill(pid, 9)
+        except Exception as e:
+            error(f"无法结束 PID {pid}：{e}")
+
+    # 等端口释放
+    for _ in range(20):
+        time.sleep(0.25)
+        if not _pids_listening_on_port(port):
+            info(f"端口 {port} 已释放")
+            return True
+
+    left = _pids_listening_on_port(port)
+    error(f"端口 {port} 仍被占用：{left}；请手动结束或改 config.json 的 port")
+    return False
+
+
 def _build_cmd(model: ModelInfo, mmproj: Path | None, exe: Path, srv: dict) -> list[str]:
     cmd = [
         str(exe),
@@ -518,6 +646,8 @@ def start(model: ModelInfo) -> bool:
         return False
 
     stop()
+    if not clear_port(config.PORT):
+        return False
     mmproj = _resolve_mmproj(model)
     srv = dict(config.SERVER)
     cmd = _build_cmd(model, mmproj, exe, srv)
@@ -584,7 +714,8 @@ def start(model: ModelInfo) -> bool:
     return True
 
 
-def _print_log_tail(n: int = 25) -> None:
+def print_log_tail(n: int = 25) -> None:
+    """打印最近若干行 llama-server 日志（失败排查用）。"""
     tail = _state.log[-n:]
     if not tail:
         return
@@ -592,6 +723,10 @@ def _print_log_tail(n: int = 25) -> None:
     for ln in tail:
         style = "red" if _ERROR_RE.search(ln) else "dim"
         console.print(f"[{style}]{ln}[/]")
+
+
+# 兼容内部旧名
+_print_log_tail = print_log_tail
 
 
 def _print_hints() -> None:
@@ -647,6 +782,21 @@ def current_model() -> ModelInfo | None:
     return _state.model
 
 
+def owned_proc() -> subprocess.Popen | None:
+    """本进程拉起的 llama-server；attach 模式为 None。"""
+    return _state.proc if _state.owned else None
+
+
+def model_id() -> str:
+    """Cursor 可填的模型 id：优先 /v1/models，否则用 MODEL_LABEL。"""
+    data = _get_json("/v1/models", timeout=3.0) or {}
+    for item in data.get("data") or []:
+        mid = str(item.get("id") or "").strip()
+        if mid:
+            return mid
+    return config.MODEL_LABEL or ""
+
+
 # ------------------------------------------------------------------------
 #  启动流程 / 切换
 # ------------------------------------------------------------------------
@@ -659,12 +809,13 @@ def ensure_backend() -> bool:
         return False
     if choice == "attach":
         apply_props()
+        info(f"已接入运行中的服务 {config.HOST}:{config.PORT}")
         return True
     return start(choice)
 
 
 def switch_model() -> bool:
-    """/model：重新选一个本地 GGUF 并重启服务。失败时保留旧服务（若仍在）。"""
+    """重新选一个本地 GGUF 并重启服务。"""
     choice = pick_model(allow_attach=False)
     if choice is None:
         return False

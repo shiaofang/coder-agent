@@ -1,11 +1,10 @@
-"""进程退出兜底：点控制台窗口 X / 注销 / 关机时也关掉子服务。
+"""进程退出兜底：点控制台窗口 X / 注销 / 关机时也关掉 llama-server。
 
 仅靠 atexit 不够——Windows 关窗发的是 CTRL_CLOSE_EVENT，常来不及跑到
 正常 finally。这里做两件事：
 
-1. SetConsoleCtrlHandler：关窗瞬间主动 stop llama-server + 后台进程
+1. SetConsoleCtrlHandler：关窗瞬间主动 server.stop()
 2. Job Object（KILL_ON_JOB_CLOSE）：本进程被强杀时，子进程一并带走
-   （attach 到外部已有 llama-server 的情况仍靠 1 里的 _kill_stale）
 """
 
 from __future__ import annotations
@@ -21,12 +20,6 @@ _installed = False
 
 
 def _cleanup() -> None:
-    try:
-        from agent.tools import kill_all_background
-
-        kill_all_background()
-    except Exception:
-        pass
     try:
         from agent import server
 
