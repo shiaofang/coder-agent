@@ -166,7 +166,10 @@ models/Qwen3.5-9B-Q4_K_M.mmproj.gguf
 本项目只认官方 llama.cpp 能加载的标准 GGUF。文件名带 `PTQ1_0` / `PQ2_0` 的三值/二值量化权重会被跳过，请不要放进 `models/`。
 
 启动前会先读一次 `llama-server --help`，只传它认识的参数（`--jinja` / `--tools` / `-fitt`），
-缺哪个就自动退回 `-ngl 99 -c <fit_ctx>`。
+缺哪个就自动退回 `-ngl 99 -c <模型标称上下文>`。
+
+`server.ctx` 默认 `null`：不传 `-c`，llama-server 按 GGUF 标称上限开上下文（如 Qwen3.5-4B 的 256K），
+显存不够时由 `--fit` 自动下调。想写死就设 `server.ctx`（或环境变量 `CODER_AGENT_CTX`）。
 
 #### 思考深度
 
@@ -201,7 +204,7 @@ copy config.example.json config.json
   "host": "127.0.0.1",
   "port": 8080,
   "tavily_api_key": "",
-  "server":   { "fit_margin": 384, "fit_ctx": 16384, "ngl": null, "ctx": null, "extra_args": [] },
+  "server":   { "fit_margin": 384, "fit_ctx": null, "ngl": null, "ctx": null, "extra_args": [] },
   "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat_penalty": null }
 }
 ```
@@ -211,8 +214,8 @@ copy config.example.json config.json
 | `host` / `port` | 本地 llama-server 监听地址 |
 | `tavily_api_key` | [Tavily](https://app.tavily.com) 搜索 Key（或环境变量 `TAVILY_API_KEY`）。**没配时不会把 `web_search` / `fetch_url` 暴露给模型**，省 token 也免报错 |
 | `server.fit_margin` | 自适应显存时预留给桌面的 MiB（`-fitt`）。留太多会把层挤到 CPU 变慢 |
-| `server.fit_ctx` | 自适应允许的最小上下文（`-fitc`）。系统提示 + 工具声明约 2k token，别低于 8192 |
-| `server.ngl` / `server.ctx` | 手动写死 `-ngl` / `-c`（写了就不再自适应）；环境变量 `CODER_AGENT_NGL` / `CODER_AGENT_CTX` 优先 |
+| `server.fit_ctx` | `--fit` 允许的最小上下文（`-fitc`）。`null` = 不传，用 llama 默认 4096；系统提示 + 工具声明约 2k，建议别低于 8192 |
+| `server.ngl` / `server.ctx` | 手动写死 `-ngl` / `-c`。`ctx: null`（默认）= 用模型标称上限，显存不够由 `--fit` 下调；环境变量 `CODER_AGENT_NGL` / `CODER_AGENT_CTX` 优先 |
 | `server.extra_args` | 追加给 llama-server 的其它参数 |
 | `sampling.*` | 采样参数，非空字段才发给模型。示例值是 Qwen3 系列推荐 |
 
@@ -296,7 +299,7 @@ copy config.example.json config.json
 | 双击 `start.bat` 窗口一闪而过，什么都没有 | 多半是 Python 没装或没加进 PATH。在命令行 `python --version` 确认；也可以在窗口里手动 `python chat.py` 看报错 |
 | 提示找不到 `xxx.dll` / `llama-server` 闪退 | `bin/` 的 DLL 没拷全。重看 [1.3](#13-放好后-bin-里应该有什么)，CUDA 版记得连 `cudart-*` 包一起解压 |
 | 模型加载失败，日志里有 `invalid ggml type` | 该量化档这份 `llama-server` 不认识。换标准 GGUF，或把 `bin/` 升到较新的官方构建 |
-| 模型加载失败，日志里有 `out of memory` | 显存不够。调小 `config.json` 的 `server.fit_ctx`（如 `8192`），或调大 `server.fit_margin` |
+| 模型加载失败，日志里有 `out of memory` | 显存不够。在 `config.json` 写小 `server.ctx`（如 `8192`），或调大 `server.fit_margin` |
 | 起来了但很慢（个位数 tok/s） | GPU 放不下、层落到了 CPU。换更小的量化档（Q4）、调小上下文，或用参数量更小的模型 |
 | 模型不调用工具 / 只会聊天 | 该 GGUF 不支持 tool calling，换支持的模型（如 Qwen3.5 系列） |
 | `web_search` 用不了 | 没配 `tavily_api_key`；不配的话这个工具根本不会出现，属正常 |

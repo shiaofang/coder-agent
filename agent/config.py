@@ -32,12 +32,12 @@ CONFIG_ERROR: str | None = None
 
 # llama-server 启动参数（config.json -> "server"）
 #   fit_margin  — 预留给桌面/浏览器的显存 MiB（-fitt）
-#   fit_ctx     — --fit 允许的最小上下文（-fitc）；系统提示 + 工具声明约 2k token
-#   ngl / ctx   — 手动写死 -ngl / -c（None = 交给 --fit 自适应）
+#   fit_ctx     — --fit 允许的最小上下文（-fitc）；None = 不传，用 llama 默认 4096
+#   ngl / ctx   — 手动写死 -ngl / -c（None = 交给 --fit；ctx=None 时 -c 取模型标称上限）
 #   extra_args  — 追加的原始参数列表
 SERVER: dict = {
     "fit_margin": 384,
-    "fit_ctx": 16384,
+    "fit_ctx": None,
     "ngl": None,
     "ctx": None,
     "extra_args": [],
@@ -96,13 +96,23 @@ def _load_config() -> None:
     # —— llama-server 参数 ——
     srv = data.get("server")
     if isinstance(srv, dict):
-        for key in ("fit_margin", "fit_ctx", "ngl", "ctx"):
-            if key in srv and srv[key] not in (None, ""):
-                try:
-                    SERVER[key] = int(srv[key])
-                except (TypeError, ValueError):
-                    CONFIG_ERROR = f"config.json 的 server.{key} 必须是整数"
-                    return
+        for key in ("ngl", "ctx", "fit_ctx"):
+            if key not in srv:
+                continue
+            if srv[key] in (None, ""):
+                SERVER[key] = None
+                continue
+            try:
+                SERVER[key] = int(srv[key])
+            except (TypeError, ValueError):
+                CONFIG_ERROR = f"config.json 的 server.{key} 必须是整数或 null"
+                return
+        if "fit_margin" in srv and srv["fit_margin"] not in (None, ""):
+            try:
+                SERVER["fit_margin"] = int(srv["fit_margin"])
+            except (TypeError, ValueError):
+                CONFIG_ERROR = "config.json 的 server.fit_margin 必须是整数"
+                return
         extra = srv.get("extra_args")
         if isinstance(extra, list):
             SERVER["extra_args"] = [str(x) for x in extra]
@@ -148,10 +158,14 @@ VERBOSE = False  # /verbose → 工具结果 / 思考全量显示
 
 
 def n_ctx() -> int:
-    """当前上下文长度（未知时用 server.fit_ctx）。"""
+    """当前上下文长度（未知时回退 8192，仅作压缩/状态栏估算）。"""
     if MODEL_N_CTX > 0:
         return MODEL_N_CTX
-    return int(SERVER["fit_ctx"])
+    if SERVER.get("ctx"):
+        return int(SERVER["ctx"])
+    if SERVER.get("fit_ctx"):
+        return int(SERVER["fit_ctx"])
+    return 8192
 
 
 # 用户可输入的斜杠命令（不区分大小写，在 main 里处理）

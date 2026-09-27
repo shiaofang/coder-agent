@@ -6,7 +6,7 @@
 
   "server": {
     "fit_margin": 384,
-    "fit_ctx": 16384,
+    "fit_ctx": null,
     "ngl": null,
     "ctx": null,
     "extra_args": []

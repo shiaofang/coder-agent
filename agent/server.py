@@ -49,14 +49,16 @@ _EFFORT_LABELS = {
 }
 
 
-def _read_chat_template(path: Path) -> str:
-    """只读 GGUF 头部的 KV 元数据，取出 tokenizer.chat_template（不加载张量）。"""
+def _read_gguf_meta(path: Path) -> tuple[str, int]:
+    """只读 GGUF 头部 KV：返回 (chat_template, context_length)。context_length=0 表示未知。"""
     import struct
     fixed = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    template = ""
+    n_ctx_train = 0
     try:
         with open(path, "rb") as f:
             if f.read(4) != b"GGUF":
-                return ""
+                return "", 0
             f.read(4)  # version
             struct.unpack("<Q", f.read(8))  # tensor count
             n_kv = struct.unpack("<Q", f.read(8))[0]
@@ -65,11 +67,32 @@ def _read_chat_template(path: Path) -> str:
                 ln = struct.unpack("<Q", f.read(8))[0]
                 return f.read(ln)
 
-            def skip_value(t: int) -> None:
-                if t == 8:  # string
-                    ln = struct.unpack("<Q", f.read(8))[0]
-                    f.seek(ln, 1)
-                elif t == 9:  # array
+            def read_value(t: int):
+                if t == 0:
+                    return struct.unpack("<B", f.read(1))[0]
+                if t == 1:
+                    return struct.unpack("<b", f.read(1))[0]
+                if t == 2:
+                    return struct.unpack("<H", f.read(2))[0]
+                if t == 3:
+                    return struct.unpack("<h", f.read(2))[0]
+                if t == 4:
+                    return struct.unpack("<I", f.read(4))[0]
+                if t == 5:
+                    return struct.unpack("<i", f.read(4))[0]
+                if t == 6:
+                    return struct.unpack("<f", f.read(4))[0]
+                if t == 7:
+                    return struct.unpack("<B", f.read(1))[0]
+                if t == 8:
+                    return rd_str_bytes().decode("utf-8", "replace")
+                if t == 10:
+                    return struct.unpack("<Q", f.read(8))[0]
+                if t == 11:
+                    return struct.unpack("<q", f.read(8))[0]
+                if t == 12:
+                    return struct.unpack("<d", f.read(8))[0]
+                if t == 9:  # array — 这里用不到，直接跳过
                     et = struct.unpack("<I", f.read(4))[0]
                     cnt = struct.unpack("<Q", f.read(8))[0]
                     if et == 8:
@@ -78,19 +101,30 @@ def _read_chat_template(path: Path) -> str:
                             f.seek(ln, 1)
                     else:
                         f.seek(fixed.get(et, 0) * cnt, 1)
-                else:
-                    f.seek(fixed.get(t, 0), 1)
+                    return None
+                f.seek(fixed.get(t, 0), 1)
+                return None
 
             for _ in range(n_kv):
                 key = rd_str_bytes().decode("utf-8", "replace")
                 vtype = struct.unpack("<I", f.read(4))[0]
                 if key == "tokenizer.chat_template" and vtype == 8:
-                    ln = struct.unpack("<Q", f.read(8))[0]
-                    return f.read(ln).decode("utf-8", "replace")
-                skip_value(vtype)
+                    template = rd_str_bytes().decode("utf-8", "replace")
+                elif key.endswith(".context_length") and vtype in (0, 1, 2, 3, 4, 5, 10, 11):
+                    val = read_value(vtype)
+                    try:
+                        n = int(val)  # type: ignore[arg-type]
+                        if n > n_ctx_train:
+                            n_ctx_train = n
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    read_value(vtype)
+                    continue
+                # context_length / template 已在上面消费；其它分支走 read_value
     except Exception:
-        return ""
-    return ""
+        return template, n_ctx_train
+    return template, n_ctx_train
 
 
 def _parse_reasoning_levels(template: str) -> list[str]:
@@ -114,22 +148,34 @@ def _parse_reasoning_levels(template: str) -> list[str]:
     return [x for x in order if x in found]
 
 
-_tmpl_cache: dict[str, tuple[float, list[str]]] = {}
+# path -> (mtime, reasoning_levels, n_ctx_train)
+_meta_cache: dict[str, tuple[float, list[str], int]] = {}
 
 
-def reasoning_levels(path: Path) -> list[str]:
-    """带缓存地取某模型支持的思考深度档位（按文件 mtime 失效）。"""
+def _gguf_meta(path: Path) -> tuple[list[str], int]:
+    """带缓存地取思考深度档位与模型标称上下文。"""
     key = str(path)
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return []
-    hit = _tmpl_cache.get(key)
+        return [], 0
+    hit = _meta_cache.get(key)
     if hit and hit[0] == mtime:
-        return hit[1]
-    levels = _parse_reasoning_levels(_read_chat_template(path))
-    _tmpl_cache[key] = (mtime, levels)
-    return levels
+        return hit[1], hit[2]
+    template, n_ctx_train = _read_gguf_meta(path)
+    levels = _parse_reasoning_levels(template)
+    _meta_cache[key] = (mtime, levels, n_ctx_train)
+    return levels, n_ctx_train
+
+
+def reasoning_levels(path: Path) -> list[str]:
+    """带缓存地取某模型支持的思考深度档位（按文件 mtime 失效）。"""
+    return _gguf_meta(path)[0]
+
+
+def n_ctx_train(path: Path) -> int:
+    """GGUF 元数据里的标称上下文（如 qwen35.context_length）；未知为 0。"""
+    return _gguf_meta(path)[1]
 
 
 @dataclass
@@ -138,6 +184,7 @@ class ModelInfo:
     size_gb: float
     params_b: float | None
     mmproj: Path | None
+    n_ctx_train: int = 0
 
     @property
     def name(self) -> str:
@@ -186,6 +233,7 @@ def list_models() -> list[ModelInfo]:
                 size_gb=p.stat().st_size / (1024**3),
                 params_b=parse_params_b(p.name),
                 mmproj=mm if mm.is_file() else None,
+                n_ctx_train=n_ctx_train(p),
             )
         )
     return out
@@ -226,6 +274,7 @@ def pick_model(allow_attach: bool = False) -> ModelInfo | str | None:
     table.add_column("模型")
     table.add_column("大小", justify="right", style="dim")
     table.add_column("参数", justify="right", style="dim")
+    table.add_column("上下文", justify="right", style="dim")
     table.add_column("视觉", style="dim")
     table.add_column("思考深度", style="dim")
     for i, m in enumerate(models, 1):
@@ -235,11 +284,18 @@ def pick_model(allow_attach: bool = False) -> ModelInfo | str | None:
             mark = " [dim](上次)[/]"
         levels = m.reasoning_levels
         depth = "/".join(_EFFORT_LABELS.get(x, x) for x in levels) if levels else "-"
+        if m.n_ctx_train >= 1024:
+            ctx_s = f"{m.n_ctx_train / 1024:.0f}k"
+        elif m.n_ctx_train:
+            ctx_s = str(m.n_ctx_train)
+        else:
+            ctx_s = "-"
         table.add_row(
             str(i),
             m.name + mark,
             f"{m.size_gb:.1f} GB",
             f"{m.params_b:g}B" if m.params_b else "-",
+            ctx_s,
             "mmproj" if m.mmproj else "",
             depth,
         )
@@ -248,7 +304,7 @@ def pick_model(allow_attach: bool = False) -> ModelInfo | str | None:
     if allow_attach:
         extra_idx += 1
         attach_idx = extra_idx
-        table.add_row(str(attach_idx), f"↪ 使用已在运行的 llama-server ({config.HOST}:{config.PORT})", "", "", "", "")
+        table.add_row(str(attach_idx), f"↪ 使用已在运行的 llama-server ({config.HOST}:{config.PORT})", "", "", "", "", "")
 
     console.print()
     console.print("[bold]选择模型[/]")
@@ -395,20 +451,24 @@ def _build_cmd(model: ModelInfo, mmproj: Path | None, exe: Path, srv: dict) -> l
         cmd += ["--tools", "all"]  # 网页界面自带的内置工具，终端 agent 不依赖它
     if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
         cmd += ["--reasoning-effort", config.REASONING_EFFORT]
-    # 没写死 -ngl/-c 时交给 --fit 按空闲显存自适应
+    # ctx=None → 不传 -c（llama 默认 0 = 模型标称上限）；显存不够时由 --fit 下调
+    # fit_ctx=None → 不传 -fitc（llama 默认下限 4096）
     if srv.get("ngl") is not None:
         cmd += ["-ngl", str(srv["ngl"])]
     if srv.get("ctx") is not None:
         cmd += ["-c", str(srv["ctx"])]
     if srv.get("ngl") is None or srv.get("ctx") is None:
         if _supports(exe, "-fitt"):
-            cmd += ["-fitt", str(srv["fit_margin"]), "-fitc", str(srv["fit_ctx"])]
+            cmd += ["-fitt", str(srv["fit_margin"])]
+            if srv.get("fit_ctx") is not None:
+                cmd += ["-fitc", str(srv["fit_ctx"])]
         else:
-            # 旧基线没有 --fit：尽量全放显存 + 固定上下文，不够时由用户配 ngl/ctx
+            # 旧基线没有 --fit：尽量全放显存；上下文取手动值或模型标称上限
             if srv.get("ngl") is None:
                 cmd += ["-ngl", "99"]
             if srv.get("ctx") is None:
-                cmd += ["-c", str(srv["fit_ctx"])]
+                c = model.n_ctx_train or srv.get("fit_ctx") or 8192
+                cmd += ["-c", str(c)]
     if mmproj:
         cmd += ["--mmproj", str(mmproj)]
     cmd += list(srv.get("extra_args") or [])
@@ -484,8 +544,11 @@ def start(model: ModelInfo) -> bool:
     holder: dict = {"line": ""}
     threading.Thread(target=_reader, args=(proc.stdout, holder), daemon=True).start()
 
-    tune = "自适应显存" if srv.get("ngl") is None and srv.get("ctx") is None else \
-        f"ngl={srv.get('ngl')} ctx={srv.get('ctx')}"
+    if srv.get("ngl") is None and srv.get("ctx") is None:
+        model_ctx = f"{model.n_ctx_train}" if model.n_ctx_train else "?"
+        tune = f"自适应显存, 目标 ctx=模型上限 {model_ctx}"
+    else:
+        tune = f"ngl={srv.get('ngl')} ctx={srv.get('ctx')}"
     console.print(f"[dim]启动 llama-server：{model.name}  ({tune}{', 视觉 on' if mmproj else ''})[/]")
     if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
         cn = _EFFORT_LABELS.get(config.REASONING_EFFORT, config.REASONING_EFFORT)
@@ -535,7 +598,8 @@ def _print_hints() -> None:
     elif "invalid argument" in text or "unknown argument" in text or "error while handling argument" in text:
         warn("启动参数不被这份 llama-server 支持：检查 config.json 的 server.extra_args")
     elif "out of memory" in text or "cuda" in text and "failed" in text:
-        warn("显存不足：把 config.json 里 server.fit_ctx 调小（如 8192），或调大 fit_margin")
+        warn("显存不足：把 config.json 里 server.ctx 写小一点（如 8192），或调大 fit_margin；"
+             "也可设 fit_ctx 提高 --fit 下限（默认不设 = 用模型上限并按显存下调）")
     elif "failed to load model" in text or "invalid" in text:
         warn("模型文件损坏或 llama-server 版本过旧，无法识别该 GGUF")
     elif "address already in use" in text or "bind" in text:
