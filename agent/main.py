@@ -30,10 +30,11 @@ from agent.config import (
 )
 from agent.loop import run_agent_turn
 from agent.paths import _looks_like_path_input, extract_abs_paths, resolve_path, switch_cwd
+from agent.process_guard import install as install_process_guard
 from agent.prompts import build_system_prompt
 from agent.render import console, ctx_bar, error, info, show_banner, warn
 from agent.terminal import enable_ansi, read_input, set_toolbar_provider
-from agent.tools import clear_todos, get_todos, set_todos
+from agent.tools import clear_todos, get_todos, kill_all_background, set_todos
 
 
 def _resolve_target_dir(path_candidate: str) -> Path | None:
@@ -76,6 +77,7 @@ def _print_help() -> None:
 def main() -> int:
     """程序入口。返回 0 表示正常退出，1 表示模型服务不可用。"""
     enable_ansi()
+    install_process_guard()  # 点窗口 X 关窗时也能杀掉 llama-server / 后台进程
     for stream in (sys.stdout, sys.stdin):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
@@ -88,6 +90,16 @@ def main() -> int:
     if not server.ensure_backend():
         return 1
 
+    try:
+        return _chat_loop()
+    finally:
+        # /exit、Ctrl+C：关掉后台开发服务 + llama-server，不留进程
+        kill_all_background()
+        server.stop()
+
+
+def _chat_loop() -> int:
+    """横幅 → 读输入 → Agent 循环（假定模型服务已就绪）。"""
     # 2) 启动参数里给了目录就先切过去
     startup_dir = _startup_dir_from_argv()
     if startup_dir is not None:
@@ -333,5 +345,4 @@ def main() -> int:
         finally:
             sess.save(messages, get_todos())
 
-    server.stop()
     return 0

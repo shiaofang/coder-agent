@@ -33,6 +33,7 @@
   agent/context.py       — 上下文用量估算与压缩
   agent/session.py       — 会话保存 / 恢复
   agent/paths.py         — Windows 路径解析
+  agent/process_guard.py — 关窗 / 强杀时带走子进程
   agent/tools.py         — tool_xxx 真正干活 + execute_tool 分发
   agent/model.py         — 跟 llama-server 通信 / chat_once
   agent/loop.py          — 多轮「思考 → 用工具 → 再思考」

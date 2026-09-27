@@ -304,7 +304,11 @@ def pick_model(allow_attach: bool = False) -> ModelInfo | str | None:
     if allow_attach:
         extra_idx += 1
         attach_idx = extra_idx
-        table.add_row(str(attach_idx), f"↪ 使用已在运行的 llama-server ({config.HOST}:{config.PORT})", "", "", "", "", "")
+        table.add_row(
+            str(attach_idx),
+            f"↪ 使用已在运行的 llama-server ({config.HOST}:{config.PORT})（退出时关闭）",
+            "", "", "", "", "",
+        )
 
     console.print()
     console.print("[bold]选择模型[/]")
@@ -514,7 +518,6 @@ def start(model: ModelInfo) -> bool:
         return False
 
     stop()
-    _kill_stale()
     mmproj = _resolve_mmproj(model)
     srv = dict(config.SERVER)
     cmd = _build_cmd(model, mmproj, exe, srv)
@@ -609,20 +612,32 @@ def _print_hints() -> None:
 
 
 def stop() -> None:
+    """结束本进程拉起的 llama-server；attach 到已有实例时同样关掉，不留后台。"""
     proc = _state.proc
-    if proc is None:
-        return
-    if proc.poll() is None:
+    if proc is not None and proc.poll() is None:
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
+    # attach / 异常残留：按镜像名再清一遍，确保退出后端口与显存都释放
+    _kill_stale()
     _state.proc = None
     _state.owned = False
+    _state.model = None
 
 
 atexit.register(stop)

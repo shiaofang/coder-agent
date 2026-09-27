@@ -13,6 +13,7 @@
   terminal        — 按键读取、确认菜单、prompt_toolkit 输入
   session         — 会话落盘 / 恢复
   paths           — Windows 路径解析
+  process_guard   — 关窗 / 强杀时带走子进程
   loop            — run_agent_turn 多轮工具循环
   main            — 程序入口
 

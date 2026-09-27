@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import atexit
 import inspect
 import json
 import os
@@ -29,7 +30,7 @@ from agent.paths import resolve_path
 from agent.render import show_note
 
 # 本次会话里通过 run_command 启动的后台进程：pid -> {proc, cmd, cwd, log_path, started_at}
-# 只在内存里维护，agent 进程退出后自然清空。
+# 退出时会一并杀掉，不留开发服务器。
 _BG_PROCESSES: dict[int, dict] = {}
 
 # 一次 read_file 最多读几个文件；再多模型也消化不了，还会挤爆上下文
@@ -753,6 +754,19 @@ def _proc_kill(pid: int) -> str:
         return f"ERROR: failed to kill pid={pid}: {e}"
     _BG_PROCESSES.pop(pid, None)
     return f"OK: killed process {pid} and its child processes"
+
+
+def kill_all_background() -> None:
+    """结束本次会话启动的全部后台进程（退出时调用，不留开发服务器）。"""
+    for pid in list(_BG_PROCESSES.keys()):
+        try:
+            _proc_kill(pid)
+        except Exception:
+            pass
+
+
+atexit.register(kill_all_background)
+
 
 def tool_run_command(command: str, cwd: str | None = None) -> str:
     """工具实现：在 shell 里执行命令；开发服务器会转后台。"""
