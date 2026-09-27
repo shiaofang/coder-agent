@@ -10,12 +10,14 @@ venv/
 
 # Local llama runtime (large binaries)
 models/
+bin/
 *.gguf
 *.dll
 *.exe
 
 # Runtime config (contains API keys) — copy from config.example.json
 config.json
+cloud_config.json
 
 # Runtime state
 sessions/
@@ -25,15 +27,12 @@ sessions/
 # IDE / OS
 .idea/
 .vscode/
-.kilo/
-.kilocode/
 *.swp
 .DS_Store
 Thumbs.db
 desktop.ini
 
 # Logs / temp
-tmp/
 *.log
 *.tmp
 *.bak
