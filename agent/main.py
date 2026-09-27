@@ -29,6 +29,14 @@ def _print_cursor_hints() -> None:
 
     console.print()
     console.print("[bold]Cursor 本地模型已就绪[/]")
+    n_ctx = config.MODEL_N_CTX
+    if n_ctx >= 1024:
+        ctx_line = f"{n_ctx}（约 {n_ctx / 1024:.0f}k）"
+    elif n_ctx:
+        ctx_line = str(n_ctx)
+    else:
+        ctx_line = "未知（可打开 /props 查看 n_ctx）"
+    console.print(f"  实际上下文：[cyan]{ctx_line}[/]")
     console.print(f"  本机 OpenAI 兼容接口：[blue]{local}/v1[/]")
     console.print(f"  OpenAI API Key：[cyan]{token}[/]")
     console.print(f"  模型名可填：[cyan]{model}[/]")

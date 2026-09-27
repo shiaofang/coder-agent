@@ -274,7 +274,7 @@ def pick_model(allow_attach: bool = False) -> ModelInfo | str | None:
     table.add_column("模型")
     table.add_column("大小", justify="right", style="dim")
     table.add_column("参数", justify="right", style="dim")
-    table.add_column("上下文", justify="right", style="dim")
+    table.add_column("标称上下文", justify="right", style="dim")
     table.add_column("视觉", style="dim")
     table.add_column("思考深度", style="dim")
     for i, m in enumerate(models, 1):
@@ -709,7 +709,21 @@ def start(model: ModelInfo) -> bool:
     config.MODEL_PARAMS_B = model.params_b
     apply_props()
     vision = "视觉 on" if mmproj else "文本"
-    info(f"模型就绪：{model.name}  ctx={config.MODEL_N_CTX or '?'}  {vision}")
+    actual = config.MODEL_N_CTX
+    if actual >= 1024:
+        actual_s = f"{actual}（约 {actual / 1024:.0f}k）"
+    elif actual:
+        actual_s = str(actual)
+    else:
+        actual_s = "?"
+    train = model.n_ctx_train
+    if train >= 1024:
+        train_s = f"{train / 1024:.0f}k"
+    elif train:
+        train_s = str(train)
+    else:
+        train_s = "?"
+    info(f"模型就绪：{model.name}  实际上下文={actual_s}  标称={train_s}  {vision}")
     console.print(f"  [dim]网页聊天界面（llama-server 自带，Ctrl+点击打开）：[/][blue underline]http://{config.HOST}:{config.PORT}[/]")
     return True
 
@@ -788,13 +802,19 @@ def owned_proc() -> subprocess.Popen | None:
 
 
 def model_id() -> str:
-    """Cursor 可填的模型 id：优先 /v1/models，否则用 MODEL_LABEL。"""
+    """Cursor 建议填写的模型名：只用文件名，不绑盘符绝对路径。
+
+    llama-server 的 /v1/models 常返回整段路径；换盘/搬家后路径会变，
+    短名（如 Qwen3.5-4B-Q5_K_M.gguf）更稳，也和 MODEL_LABEL 一致。
+    """
+    if config.MODEL_LABEL:
+        return Path(config.MODEL_LABEL).name
     data = _get_json("/v1/models", timeout=3.0) or {}
     for item in data.get("data") or []:
         mid = str(item.get("id") or "").strip()
         if mid:
-            return mid
-    return config.MODEL_LABEL or ""
+            return Path(mid).name
+    return ""
 
 
 # ------------------------------------------------------------------------
