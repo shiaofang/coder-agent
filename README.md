@@ -34,7 +34,7 @@ bin\llama-server.exe --version
 
 ### 2. 准备 `models/`
 
-放入 GGUF。视觉 projector 命名为 `模型名.mmproj.gguf` 会自动挂载。
+放入 GGUF。视觉 projector 直接放 `mmproj-F16.gguf`（或任意 `mmproj*.gguf`）即可被所有模型共用；也可按 `模型名.mmproj.gguf` 单独配对（优先）。
 
 ### 3. 配置（可选）
 
@@ -79,7 +79,6 @@ Settings → Models：
 |----|-----|
 | OpenAI API Key | `cursor-local` |
 | Override OpenAI Base URL | `https://xxxx.trycloudflare.com/v1` |
-| 模型名 | 启动日志中的名称 |
 
 Base URL 末尾必须带 `/v1`。聊天选择 **Agent**。
 

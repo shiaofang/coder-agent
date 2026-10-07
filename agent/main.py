@@ -18,11 +18,6 @@ def _cursor_api_key() -> str:
 def _print_cursor_hints() -> None:
     """打印 Cursor 配置与 cloudflared 隧道命令（本机地址 Cursor 通常访问不到）。"""
     host, port = config.HOST, config.PORT
-    model = config.MODEL_LABEL or "（见 /v1/models）"
-    # 优先用服务端 /v1/models 的 id
-    mid = server.model_id()
-    if mid:
-        model = mid
     token = _cursor_api_key()
     local = f"http://{host}:{port}"
     bundled = config.ROOT_DIR / "cloudflared-windows-amd64.exe"
@@ -39,7 +34,6 @@ def _print_cursor_hints() -> None:
     console.print(f"  实际上下文：[cyan]{ctx_line}[/]")
     console.print(f"  本机 OpenAI 兼容接口：[blue]{local}/v1[/]")
     console.print(f"  OpenAI API Key：[cyan]{token}[/]")
-    console.print(f"  模型名可填：[cyan]{model}[/]")
     console.print()
     console.print("  [dim]Cursor 通常不能直接访问 127.0.0.1。另开一个终端执行隧道：[/]")
     console.print(f"    [green]cloudflared tunnel --url {local} --protocol http2[/]")
@@ -51,7 +45,7 @@ def _print_cursor_hints() -> None:
     console.print()
     console.print("  把打印出的 [cyan]https://….trycloudflare.com[/] 加上 [cyan]/v1[/]，填到：")
     console.print("    Cursor Settings → Models → Override OpenAI Base URL")
-    console.print(f"  OpenAI API Key 填 [cyan]{token}[/]，添加模型名 [cyan]{model}[/]。")
+    console.print(f"  OpenAI API Key 填 [cyan]{token}[/]。")
     console.print()
     console.print("  [dim]本窗口需保持打开。Ctrl+C 或关闭终端会结束 llama-server。[/]")
     console.print()

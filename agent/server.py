@@ -216,6 +216,24 @@ def parse_params_b(name: str) -> float | None:
     return max(hits) if hits else None
 
 
+def _paired_mmproj(model_path: Path) -> Path | None:
+    """可选：模型同名配对 Qwen-Q4.gguf → Qwen-Q4.mmproj.gguf"""
+    mm = Path(str(model_path.with_suffix("")) + ".mmproj.gguf")
+    return mm if mm.is_file() else None
+
+
+def _shared_mmproj() -> Path | None:
+    """官方常见命名：mmproj-F16.gguf / mmproj-BF16.gguf 等，多量化共用。"""
+    for p in sorted(config.MODEL_DIR.glob("mmproj*.gguf")):
+        return p
+    return None
+
+
+def _find_mmproj(model_path: Path) -> Path | None:
+    """优先同名配对，否则自动用目录里的 mmproj*。"""
+    return _paired_mmproj(model_path) or _shared_mmproj()
+
+
 def list_models() -> list[ModelInfo]:
     if not config.MODEL_DIR.is_dir():
         return []
@@ -225,24 +243,16 @@ def list_models() -> list[ModelInfo]:
             continue
         if _UNSUPPORTED_QUANT_RE.search(p.stem):
             continue  # 三值/二值量化，官方 llama-server 无法加载
-        stem = p.with_suffix("")
-        mm = Path(str(stem) + ".mmproj.gguf")
         out.append(
             ModelInfo(
                 path=p,
                 size_gb=p.stat().st_size / (1024**3),
                 params_b=parse_params_b(p.name),
-                mmproj=mm if mm.is_file() else None,
+                mmproj=_find_mmproj(p),
                 n_ctx_train=n_ctx_train(p),
             )
         )
     return out
-
-
-def _orphan_mmproj() -> Path | None:
-    for p in sorted(config.MODEL_DIR.glob("mmproj*.gguf")):
-        return p
-    return None
 
 
 def _read_last_model() -> str:
@@ -624,18 +634,7 @@ def _reader(pipe, status_holder: dict) -> None:
 
 
 def _resolve_mmproj(model: ModelInfo) -> Path | None:
-    if model.mmproj:
-        return model.mmproj
-    cand = _orphan_mmproj()
-    if not cand:
-        return None
-    console.print(f"  [dim]发现视觉 projector：{cand.name}（只有它是为 {model.name} 生成的才能挂载；"
-                  f"重命名为 {model.path.stem}.mmproj.gguf 可跳过此询问）[/]")
-    try:
-        ans = console.input("  [dim]挂载视觉模块? [y/N]: [/]").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return None
-    return cand if ans == "y" else None
+    return model.mmproj or _find_mmproj(model.path)
 
 
 def start(model: ModelInfo) -> bool:
