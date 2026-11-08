@@ -17,7 +17,8 @@ LAST_MODEL_FILE = ROOT_DIR / ".last_model"
 
 HOST = "127.0.0.1"
 PORT = 8080
-BASE = f"http://{HOST}:{PORT}"
+# 客户端实际连接用的地址：host 是 0.0.0.0 / :: 时不能直接点开，统一显示 127.0.0.1
+CONNECT_HOST = HOST
 
 CONFIG_ERROR: str | None = None
 
@@ -27,6 +28,7 @@ SERVER: dict = {
     "fit_ctx": None,
     "ngl": None,
     "ctx": None,
+    "parallel": 4,
     "extra_args": [],
 }
 
@@ -35,7 +37,7 @@ CONFIG_PATH = ROOT_DIR / "config.json"
 
 def _load_config() -> None:
     """读取 config.json；NGL / CTX 可用环境变量覆盖。"""
-    global HOST, PORT, BASE, CONFIG_ERROR
+    global HOST, PORT, CONNECT_HOST, CONFIG_ERROR
 
     data: dict = {}
     path = CONFIG_PATH
@@ -61,7 +63,7 @@ def _load_config() -> None:
 
     srv = data.get("server")
     if isinstance(srv, dict):
-        for key in ("ngl", "ctx", "fit_ctx"):
+        for key in ("ngl", "ctx", "fit_ctx", "parallel"):
             if key not in srv:
                 continue
             if srv[key] in (None, ""):
@@ -89,24 +91,11 @@ def _load_config() -> None:
             except ValueError:
                 pass
 
-    BASE = f"http://{HOST}:{PORT}"
+    CONNECT_HOST = "127.0.0.1" if HOST in ("0.0.0.0", "::", "[::]") else HOST
 
 
 _load_config()
 
 # 当前模型信息（server.py 启动后填写）
-MODEL_LABEL = ""
-MODEL_PARAMS_B: float | None = None
 MODEL_N_CTX = 0
 REASONING_EFFORT = ""
-
-
-def n_ctx() -> int:
-    """当前上下文长度（未知时回退 8192）。"""
-    if MODEL_N_CTX > 0:
-        return MODEL_N_CTX
-    if SERVER.get("ctx"):
-        return int(SERVER["ctx"])
-    if SERVER.get("fit_ctx"):
-        return int(SERVER["fit_ctx"])
-    return 8192

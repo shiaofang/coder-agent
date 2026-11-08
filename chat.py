@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Cursor 本地模型桥接入口。
+"""本地 GGUF 模型 API 入口。
 
-选 models/ 下的 GGUF → 启动 bin/llama-server → 提示 Cloudflare 隧道，
-供 Cursor 自定义模型使用。实现见 agent/。
+选 models/ 下的 GGUF → 启动 bin/llama-server → 打印本机接口与隧道提示，
+让任何 OpenAI 兼容客户端都能调用。实现见 agent/。
 """
 
 from __future__ import annotations

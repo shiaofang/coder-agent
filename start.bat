@@ -1,10 +1,11 @@
 @echo off
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
-REM Cursor bridge: pick GGUF, start llama-server, print tunnel hints.
+REM Pick a GGUF from models/, start bin/llama-server, print API / tunnel hints.
 REM Tuning: config.json -> server: fit_margin, fit_ctx, ngl, ctx, extra_args.
-REM Env overrides: CODER_AGENT_NGL / CODER_AGENT_CTX / CURSOR_PROXY_TOKEN.
+REM Env overrides: CODER_AGENT_NGL / CODER_AGENT_CTX.
 
 where python >nul 2>&1
 if errorlevel 1 (
@@ -24,7 +25,7 @@ if errorlevel 1 (
     )
 )
 
-python "%~dp0chat.py" %*
+python "%~dp0chat.py"
 set "CHAT_EXIT=%ERRORLEVEL%"
 
 echo.

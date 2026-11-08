@@ -1,4 +1,4 @@
-"""终端输出辅助（rich）：模型选择表、启动进度、Cursor 提示用。"""
+"""终端输出辅助（rich）：模型选择表、启动进度、接口 / 隧道提示用。"""
 
 from __future__ import annotations
 
@@ -45,7 +45,3 @@ def warn(msg: str) -> None:
 
 def error(msg: str) -> None:
     console.print(f"[bold red]✗[/] {msg}")
-
-
-def dim(msg: str) -> None:
-    console.print(f"[dim]{msg}[/]")

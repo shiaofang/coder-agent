@@ -1,4 +1,4 @@
-"""本地 GGUF → llama-server → Cursor 自定义模型桥接。
+"""本地 GGUF → llama-server → OpenAI 兼容 API（可选隧道）。
 
 模块分工：
   config         — config.json、路径、运行时模型状态

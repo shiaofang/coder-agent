@@ -1,7 +1,6 @@
-"""托管本地 llama-server：列模型 → 选模型 → 启动/等待就绪 → 读 /props → 停止/切换。
+"""托管本地 llama-server：列模型 → 选模型 → 启动/等待就绪 → 读 /props → 停止。
 
-之前这些逻辑在 start.bat 里；搬进 Python 后加载错误能直接看到，
-也能在会话中 /model 切换模型而不丢对话。
+之前这些逻辑在 start.bat 里；搬进 Python 后加载错误能直接看到。
 """
 
 from __future__ import annotations
@@ -198,7 +197,6 @@ class ModelInfo:
 class _Proc:
     proc: subprocess.Popen | None = None
     log: list[str] = []
-    model: ModelInfo | None = None
     owned = False  # 是否由本进程启动（attach 到已运行服务时为 False）
 
 
@@ -394,7 +392,7 @@ def props() -> dict:
 
 
 def apply_props() -> dict:
-    """读 /props 并写进 config 的运行时字段（n_ctx / 模型名）。"""
+    """读 /props 并写进 config 的运行时字段（n_ctx）。"""
     data = props()
     gen = data.get("default_generation_settings") or {}
     n_ctx = gen.get("n_ctx") or data.get("n_ctx") or 0
@@ -402,10 +400,6 @@ def apply_props() -> dict:
         config.MODEL_N_CTX = int(n_ctx)
     except (TypeError, ValueError):
         config.MODEL_N_CTX = 0
-    model_path = str(data.get("model_path") or "")
-    if model_path and not config.MODEL_LABEL:
-        config.MODEL_LABEL = Path(model_path).name
-        config.MODEL_PARAMS_B = parse_params_b(config.MODEL_LABEL)
     return data
 
 
@@ -431,7 +425,12 @@ def _help_text(exe: Path) -> str:
     key = str(exe)
     if key not in _help_cache:
         try:
-            r = subprocess.run([key, "--help"], capture_output=True, timeout=30)
+            r = subprocess.run(
+                [key, "--help"],
+                capture_output=True,
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,  # type: ignore[attr-defined]
+            )
             _help_cache[key] = (r.stdout + r.stderr).decode("utf-8", errors="replace")
         except Exception:
             _help_cache[key] = ""  # 探测失败：按「都支持」处理，交给日志报错
@@ -585,12 +584,23 @@ def _build_cmd(model: ModelInfo, mmproj: Path | None, exe: Path, srv: dict) -> l
         "-m", str(model.path),
         "--host", config.HOST,
         "--port", str(config.PORT),
-        "-np", "1",
     ]
+    # 多个 slot 才能让客户端并发（Claude Code 一轮会同时发主对话、标题、子代理等请求）。
+    # parallel=None / 0 → 不传 -np，交给 llama-server auto（当前这份二进制 auto = 4 且 unified）。
+    parallel = srv.get("parallel")
+    if parallel and parallel > 0 and _supports(exe, "--parallel"):
+        cmd += ["-np", str(parallel)]
+        # 显式 -np 会让 unified KV 默认关闭，-c 被平分成 N 份（70656 → 17664/槽）。
+        # 打开 unified 后各槽共享同一个 -c 池，单请求仍能用满上下文。
+        if _supports(exe, "--kv-unified"):
+            cmd += ["--kv-unified"]
     if _supports(exe, "--jinja"):
         cmd += ["--jinja"]
-    if _supports(exe, "--tools "):
-        cmd += ["--tools", "all"]  # 网页界面自带的内置工具，终端 agent 不依赖它
+    # 内置工具（--tools all）默认不开：Claude Code 自带工具，再开一份会和它重复，
+    # 还多一个 exec_shell_command 执行入口。需要 Web UI Agent 时用 server.extra_args 打开。
+    alias = model.path.stem
+    if _supports(exe, "--alias"):
+        cmd += ["-a", alias]
     if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
         cmd += ["--reasoning-effort", config.REASONING_EFFORT]
     # ctx=None → 不传 -c（llama 默认 0 = 模型标称上限）；显存不够时由 --fit 下调
@@ -670,7 +680,6 @@ def start(model: ModelInfo) -> bool:
         error(f"启动 llama-server 失败：{e}")
         return False
     _state.proc = proc
-    _state.model = model
     _state.owned = True
 
     holder: dict = {"line": ""}
@@ -681,7 +690,9 @@ def start(model: ModelInfo) -> bool:
         tune = f"自适应显存, 目标 ctx=模型上限 {model_ctx}"
     else:
         tune = f"ngl={srv.get('ngl')} ctx={srv.get('ctx')}"
-    console.print(f"[dim]启动 llama-server：{model.name}  ({tune}{', 视觉 on' if mmproj else ''})[/]")
+    slots = srv.get("parallel")
+    slots_s = f"{slots} 槽共享上下文" if slots and slots > 0 else "槽数 auto"
+    console.print(f"[dim]启动 llama-server：{model.name}  ({tune}, {slots_s}{', 视觉 on' if mmproj else ''})[/]")
     if config.REASONING_EFFORT and _supports(exe, "--reasoning-effort"):
         cn = _EFFORT_LABELS.get(config.REASONING_EFFORT, config.REASONING_EFFORT)
         console.print(f"  [dim]思考深度：{cn}（--reasoning-effort {config.REASONING_EFFORT}）[/]")
@@ -699,13 +710,11 @@ def start(model: ModelInfo) -> bool:
 
     if proc.poll() is not None or not is_healthy():
         error("llama-server 未能就绪" + (f"（退出码 {proc.returncode}）" if proc.poll() is not None else "（超时）"))
-        _print_log_tail()
+        print_log_tail()
         _print_hints()
         stop()
         return False
 
-    config.MODEL_LABEL = model.name
-    config.MODEL_PARAMS_B = model.params_b
     apply_props()
     vision = "视觉 on" if mmproj else "文本"
     actual = config.MODEL_N_CTX
@@ -723,7 +732,7 @@ def start(model: ModelInfo) -> bool:
     else:
         train_s = "?"
     info(f"模型就绪：{model.name}  实际上下文={actual_s}  标称={train_s}  {vision}")
-    console.print(f"  [dim]网页聊天界面（llama-server 自带，Ctrl+点击打开）：[/][blue underline]http://{config.HOST}:{config.PORT}[/]")
+    console.print(f"  [dim]网页聊天界面（llama-server 自带，Ctrl+点击打开）：[/][blue underline]http://{config.CONNECT_HOST}:{config.PORT}[/]")
     return True
 
 
@@ -738,10 +747,6 @@ def print_log_tail(n: int = 25) -> None:
         console.print(f"[{style}]{ln}[/]")
 
 
-# 兼容内部旧名
-_print_log_tail = print_log_tail
-
-
 def _print_hints() -> None:
     text = "\n".join(_state.log).lower()
     if "invalid ggml type" in text:
@@ -749,8 +754,8 @@ def _print_hints() -> None:
     elif "invalid argument" in text or "unknown argument" in text or "error while handling argument" in text:
         warn("启动参数不被这份 llama-server 支持：检查 config.json 的 server.extra_args")
     elif "out of memory" in text or "cuda" in text and "failed" in text:
-        warn("显存不足：把 config.json 里 server.ctx 写小一点（如 8192），或调大 fit_margin；"
-             "也可设 fit_ctx 提高 --fit 下限（默认不设 = 用模型上限并按显存下调）")
+        warn("显存不足：config.json 里 server.ngl / ctx 都写了具体值时，--fit 不生效，"
+             "要改小 ctx（如 8192）；两者留 null 时才会按显存自适应，可调 fit_margin / fit_ctx")
     elif "failed to load model" in text or "invalid" in text:
         warn("模型文件损坏或 llama-server 版本过旧，无法识别该 GGUF")
     elif "address already in use" in text or "bind" in text:
@@ -785,14 +790,9 @@ def stop() -> None:
     _kill_stale()
     _state.proc = None
     _state.owned = False
-    _state.model = None
 
 
 atexit.register(stop)
-
-
-def current_model() -> ModelInfo | None:
-    return _state.model
 
 
 def owned_proc() -> subprocess.Popen | None:
@@ -800,24 +800,8 @@ def owned_proc() -> subprocess.Popen | None:
     return _state.proc if _state.owned else None
 
 
-def model_id() -> str:
-    """Cursor 建议填写的模型名：只用文件名，不绑盘符绝对路径。
-
-    llama-server 的 /v1/models 常返回整段路径；换盘/搬家后路径会变，
-    短名（如 Qwen3.5-4B-Q5_K_M.gguf）更稳，也和 MODEL_LABEL 一致。
-    """
-    if config.MODEL_LABEL:
-        return Path(config.MODEL_LABEL).name
-    data = _get_json("/v1/models", timeout=3.0) or {}
-    for item in data.get("data") or []:
-        mid = str(item.get("id") or "").strip()
-        if mid:
-            return Path(mid).name
-    return ""
-
-
 # ------------------------------------------------------------------------
-#  启动流程 / 切换
+#  启动流程
 # ------------------------------------------------------------------------
 
 def ensure_backend() -> bool:
@@ -828,19 +812,6 @@ def ensure_backend() -> bool:
         return False
     if choice == "attach":
         apply_props()
-        info(f"已接入运行中的服务 {config.HOST}:{config.PORT}")
+        info(f"已接入运行中的服务 {config.CONNECT_HOST}:{config.PORT}")
         return True
-    return start(choice)
-
-
-def switch_model() -> bool:
-    """重新选一个本地 GGUF 并重启服务。"""
-    choice = pick_model(allow_attach=False)
-    if choice is None:
-        return False
-    if _state.model is not None and choice.path == _state.model.path and is_healthy():
-        info("已经是当前模型")
-        return True
-    config.MODEL_LABEL = ""
-    config.MODEL_N_CTX = 0
     return start(choice)
